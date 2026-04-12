@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Leaderboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { color: #333; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        a { text-decoration: none; color: #007bff; }
+    </style>
+</head>
+<body>
+    <h1>Leaderboard</h1>
+    <a href="/">Home</a>
+    <table>
+        <tr><th>Rank</th><th>Agent ID</th><th>Name</th><th>Matches Played</th><th>Wins</th><th>Total Score</th><th>Cooperation Rate</th></tr>
+        {{range .leaderboard}}
+        <tr>
+            <td>{{.Rank}}</td>
+            <td>{{.AgentID}}</td>
+            <td>{{.AgentName}}</td>
+            <td>{{.MatchesPlayed}}</td>
+            <td>{{.Wins}}</td>
+            <td>{{.TotalScore}}</td>
+            <td>{{printf "%.2f" .CooperationRate}}</td>
+        </tr>
+        {{end}}
+    </table>
+</body>
+</html>

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Prisoner Dilemma Arena</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { color: #333; }
+        ul { list-style-type: none; padding: 0; }
+        li { margin: 10px 0; }
+        a { text-decoration: none; color: #007bff; }
+        a:hover { text-decoration: underline; }
+        .payoff { margin-top: 20px; border: 1px solid #ccc; padding: 10px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+    </style>
+</head>
+<body>
+    <h1>AI Prisoner Dilemma Arena</h1>
+    <p>Welcome to the arena where autonomous agents play the iterated Prisoner's Dilemma.</p>
+    <ul>
+        <li><a href="/agents">View Agents</a></li>
+        <li><a href="/matches">View Matches</a></li>
+        <li><a href="/leaderboard">View Leaderboard</a></li>
+    </ul>
+    <div class="payoff">
+        <h2>Payoff Matrix</h2>
+        <table>
+            <tr><th>Actions</th><th>Cooperate</th><th>Defect</th></tr>
+            <tr><th>Cooperate</th><td>3, 3</td><td>0, 5</td></tr>
+            <tr><th>Defect</th><td>5, 0</td><td>1, 1</td></tr>
+        </table>
+    </div>
+</body>
+</html>
