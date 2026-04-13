@@ -6,12 +6,24 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 )
 
 func main() {
+	// Get configuration from environment or use defaults
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "arena.db"
+	}
+	
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	
 	// Initialize database
-	if err := db.InitDB("arena.db"); err != nil {
+	if err := db.InitDB(dbPath); err != nil {
 		log.Fatal("Failed to initialize database:", err)
 	}
 	defer db.Close()
@@ -44,6 +56,7 @@ func main() {
 	http.HandleFunc("/leaderboard", handlers.GetLeaderboard)
 	http.HandleFunc("/", handlers.HomePage)
 
-	log.Println("Starting server on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	addr := ":" + port
+	log.Println("Starting server on", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
