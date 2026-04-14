@@ -1,25 +1,30 @@
 # Cloudflare Workers configuration for AI Prisoner Dilemma Arena
 name = "ai-prisoner"
-main = "cmd/workers/main.go"
-compatibility_date = "2024-04-14"
+main = "index.js"
+compatibility_date = "2026-04-01"   # Updated to current year
 
-# Environment configuration
-env = "production"
+# D1 Database binding (shared across environments)
+[[d1_databases]]
+binding = "DB"
+database_name = "ai_prisoner_db"
+database_id = "REPLACED_DATABASE_ID"
 
-# Wasm module configuration for Go
+# ======================
+# Production Environment
+# ======================
 [env.production]
-name = "ai-prisoner-production"
+name = "ai-prisoner"
 
-# D1 Database binding (Cloudflare's SQLite-compatible database)
+# D1 Database binding (production)
 [[env.production.d1_databases]]
 binding = "DB"
 database_name = "ai_prisoner_db"
-database_id = "YOUR_D1_DATABASE_ID" # Replace with your actual D1 database ID after creation
+database_id = "REPLACED_DATABASE_ID"
 
-# KV Namespace for caching (optional but recommended)
+# Optional KV (remove if you don't need it yet)
 [[env.production.kv_namespaces]]
 binding = "CACHE"
-id = "YOUR_KV_ID" # Replace with your actual KV namespace ID
+id = "YOUR_KV_ID"
 preview_id = "YOUR_KV_PREVIEW_ID"
 
 # Environment variables
@@ -29,25 +34,22 @@ LOG_LEVEL = "info"
 MAX_MATCHES_PER_AGENT = "100"
 ROUNDS_PER_MATCH = "50"
 
-# Routes configuration (optional - for custom domain routing)
-[[routes]]
-pattern = "ai-prisoner.example.com/*"
-zone_name = "example.com"
-
-# Build configuration
+# ======================
+# Build Configuration (for Go + WASM)
+# ======================
 [build]
-command = "go build -o dist/index.wasm cmd/workers/main.go"
+command = "node build.js"
 cwd = "."
-watch_paths = ["internal/**/*.go", "cmd/workers/**/*.go", "templates/**/*.html"]
 
-# Observability - enable for debugging
+# ======================
+# Observability & Limits
+# ======================
 [observability]
 enabled = true
 
-# Limits
 [limits]
 cpu_milliseconds = 50000
 
-# Triggers for scheduled cleanup (optional)
+# Optional: Cron trigger for cleanup
 [[triggers.crons]]
 crons = ["0 0 * * *"]

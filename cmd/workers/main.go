@@ -61,17 +61,16 @@ func registerRoutes() {
 }
 
 // main is the entry point for Cloudflare Workers
-// When running on Cloudflare Workers, this uses workers.Serve() instead of http.ListenAndServe()
-// The D1 database binding is automatically available through environment variables
+// When running on Cloudflare Workers via wrangler, this initializes the app
+// and uses workers.Serve() to handle requests
 func main() {
 	// Initialize templates
 	if err := InitializeTemplates(); err != nil {
 		log.Fatal("Failed to initialize templates:", err)
 	}
 
-	// Initialize database - in production this would use D1 binding
-	// For local development, use SQLite
-	// The D1 database connection is configured through wrangler.toml environment bindings
+	// Initialize database - uses D1 binding from wrangler.toml
+	// For local development, this uses SQLite
 	if err := db.InitDB("arena.db"); err != nil {
 		log.Fatal("Failed to initialize database:", err)
 	}
@@ -80,29 +79,7 @@ func main() {
 	// Register all routes
 	registerRoutes()
 
-	// Detect runtime environment and choose appropriate server
-	isWorker := detectCloudflareWorker()
-	
-	if isWorker {
-		// Running on Cloudflare Workers - use workers.Serve()
-		log.Println("Starting Cloudflare Worker")
-		if err := workers.Serve(nil); err != nil {
-			log.Fatal("Cloudflare Worker error:", err)
-		}
-	} else {
-		// Running locally or on traditional server - use http.ListenAndServe()
-		port := "8080"
-		addr := ":" + port
-		log.Printf("Starting local server on %s", addr)
-		log.Fatal(http.ListenAndServe(addr, nil))
-	}
-}
-
-// detectCloudflareWorker checks if we're running on Cloudflare Workers
-// by checking for the WORKERS_CF_ENVIRONMENT variable or other CF-specific markers
-func detectCloudflareWorker() bool {
-	// Check for Cloudflare-specific environment variable
-	// This would be set in wrangler.toml configuration
-	workers := workers.GetBinding("environment") != nil
-	return workers
+	// Use workers.Serve to start the HTTP server
+	// This works with Cloudflare Workers runtime
+	workers.Serve(nil)
 }
