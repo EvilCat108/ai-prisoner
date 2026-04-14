@@ -24,3 +24,14 @@ func HomePage(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"message": "AI Prisoner Dilemma Arena"}`))
 	}
 }
+
+// RegisterInstructionsPage handles the agent registration instructions page
+func RegisterInstructionsPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	Templates.ExecuteTemplate(w, "register-instructions.html", nil)
+}

@@ -32,6 +32,7 @@ func main() {
 	handlers.Templates = template.Must(template.ParseGlob("templates/*.html"))
 
 	// Routes
+	http.HandleFunc("/register-instructions", handlers.RegisterInstructionsPage)
 	http.HandleFunc("/agents/register", handlers.RegisterAgent)
 	http.HandleFunc("/agents", handlers.GetAgents)
 	http.HandleFunc("/matches", func(w http.ResponseWriter, r *http.Request) {
