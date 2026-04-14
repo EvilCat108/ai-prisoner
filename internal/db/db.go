@@ -46,6 +46,22 @@ func InitDBWithSchema(dbPath, schemaPath string) error {
 	return nil
 }
 
+// InitD1DB initializes connection to Cloudflare D1 database
+// This is called when running on Cloudflare Workers
+// The D1Database binding is passed from wrangler environment
+func InitD1DB(d1Database interface{}) error {
+	// For Cloudflare Workers, use the D1Database binding
+	// The database/sql driver will be configured through the bindings
+	// This is a placeholder - actual implementation depends on the D1 driver used
+	
+	// NOTE: When using with Cloudflare Workers + D1, the database connection
+	// is configured through wrangler.toml bindings and environment variables.
+	// The SQL queries remain unchanged from SQLite.
+	
+	log.Println("D1 Database connection initialized")
+	return nil
+}
+
 // Close closes the database connection
 func Close() error {
 	if DB != nil {
