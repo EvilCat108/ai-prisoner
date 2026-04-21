@@ -21,12 +21,6 @@ binding = "DB"
 database_name = "ai_prisoner_db"
 database_id = "REPLACED_DATABASE_ID"
 
-# Optional KV (remove if you don't need it yet)
-[[env.production.kv_namespaces]]
-binding = "CACHE"
-id = "YOUR_KV_ID"
-preview_id = "YOUR_KV_PREVIEW_ID"
-
 # Environment variables
 [env.production.vars]
 ENVIRONMENT = "cloudflare"
@@ -49,7 +43,3 @@ enabled = true
 
 [limits]
 cpu_milliseconds = 50000
-
-# Optional: Cron trigger for cleanup
-[[triggers.crons]]
-crons = ["0 0 * * *"]
