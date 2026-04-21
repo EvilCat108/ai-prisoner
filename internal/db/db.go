@@ -23,8 +23,22 @@ func InitDBWithSchema(dbPath, schemaPath string) error {
 	}
 
 	var err error
-	DB, err = sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=1000&_foreign_keys=on")
+	// Open database with basic configuration first
+	// WAL mode will be set separately after creation
+	connectionString := dbPath
+	if dbPath != ":memory:" {
+		connectionString = dbPath + "?cache=shared"
+	}
+	
+	DB, err = sql.Open("sqlite3", connectionString)
 	if err != nil {
+		log.Printf("Failed to open database: %v", err)
+		return err
+	}
+
+	// Enable foreign keys
+	if _, err := DB.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		log.Printf("Failed to enable foreign keys: %v", err)
 		return err
 	}
 
@@ -40,6 +54,16 @@ func InitDBWithSchema(dbPath, schemaPath string) error {
 	if err != nil {
 		log.Printf("Failed to execute schema: %v", err)
 		return err
+	}
+
+	// Enable WAL mode after successful schema creation
+	if dbPath != ":memory:" {
+		if _, err := DB.Exec("PRAGMA journal_mode = WAL"); err != nil {
+			log.Printf("Warning: Failed to enable WAL mode (non-fatal): %v", err)
+		}
+		if _, err := DB.Exec("PRAGMA synchronous = NORMAL"); err != nil {
+			log.Printf("Warning: Failed to set synchronous mode (non-fatal): %v", err)
+		}
 	}
 
 	log.Println("Database initialized")
