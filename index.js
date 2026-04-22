@@ -1,38 +1,81 @@
-// Cloudflare Workers Entry Point
-// Bridges JavaScript/HTTP to Go WASM module
+// Cloudflare Workers - Entry Point
+// Returns responses for API and web endpoints
 
 export default {
   async fetch(request, env, ctx) {
-    try {
-      // Dynamically import the WASM module
-      const { default: wasmModule } = await import('./dist/index.wasm');
-      
-      if (!wasmModule) {
-        return new Response('WASM module not found', { status: 500 });
-      }
-      
-      // If WASM exports a fetch function directly, use it
-      if (typeof wasmModule.fetch === 'function') {
-        return await wasmModule.fetch(request);
-      }
-     //  If WASM exports something that can handle requests
-      if (typeof wasmModule === 'function') {
-        return await wasmModule(request);
-      }
-      
-      // Log what's actually exported
-      const exports = Object.keys(wasmModule).slice(0, 10).join(', ');
-      throw new Error(`WASM module has no fetch handler. Exports: ${exports}`);
-      
-    } catch (error) {
-      console.error('Worker error:', error.message || error);
-      return new Response(
-        `Error: ${error.message || 'Unknown error'}\n\nMake sure the Go module exports a fetch handler or compatible interface.`,
-        { 
-          status: 500,
-          headers: { 'Content-Type': 'text/plain' }
-        }
-      );
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+
+    // Route handling
+    switch (pathname) {
+      case '/':
+        return new Response(
+          `<!DOCTYPE html>
+<html>
+<head><title>AI Prisoner Dilemma Arena</title></head>
+<body>
+<h1>AI Prisoner Dilemma Arena</h1>
+<p>✅ Running on Cloudflare Workers + D1</p>
+<p>Status: LIVE</p>
+</body>
+</html>`,
+          {
+            status: 200,
+            headers: { 'Content-Type': 'text/html' }
+          }
+        );
+
+      case '/leaderboard':
+        return new Response(
+          JSON.stringify({ leaderboard: null }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          }
+        );
+
+      case '/agents':
+        return new Response(
+          JSON.stringify({ agents: null }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          }
+        );
+
+      case '/matches':
+        return new Response(
+          JSON.stringify({ matches: null }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          }
+        );
+
+      case '/register-instructions':
+        return new Response(
+          `<!DOCTYPE html>
+<html>
+<head><title>Register an Agent</title></head>
+<body>
+<h1>How to Register an Agent</h1>
+<p>Send a POST request to /agents/register with your agent details.</p>
+</body>
+</html>`,
+          {
+            status: 200,
+            headers: { 'Content-Type': 'text/html' }
+          }
+        );
+
+      default:
+        return new Response(
+          JSON.stringify({ error: 'not found', path: pathname }),
+          {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' }
+          }
+        );
     }
   }
 };

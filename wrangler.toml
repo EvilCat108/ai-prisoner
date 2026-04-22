@@ -29,13 +29,6 @@ MAX_MATCHES_PER_AGENT = "100"
 ROUNDS_PER_MATCH = "50"
 
 # ======================
-# Build Configuration (for Go + WASM)
-# ======================
-[build]
-command = "node build.js"
-cwd = "."
-
-# ======================
 # Observability & Limits
 # ======================
 [observability]

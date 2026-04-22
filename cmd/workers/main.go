@@ -29,7 +29,7 @@ func registerRoutes() {
 	http.HandleFunc("/register-instructions", handlers.RegisterInstructionsPage)
 	http.HandleFunc("/agents/register", handlers.RegisterAgent)
 	http.HandleFunc("/agents", handlers.GetAgents)
-	
+
 	// Match routes (some require authentication)
 	http.HandleFunc("/matches", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
@@ -39,7 +39,7 @@ func registerRoutes() {
 			handlers.AuthMiddleware(handlers.CreateMatch)(w, r)
 		}
 	})
-	
+
 	http.HandleFunc("/matches/", handlers.AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		if strings.Contains(path, "/join") {
@@ -52,10 +52,10 @@ func registerRoutes() {
 			handlers.GetMatch(w, r)
 		}
 	}))
-	
+
 	// Leaderboard (public)
 	http.HandleFunc("/leaderboard", handlers.GetLeaderboard)
-	
+
 	// Homepage
 	http.HandleFunc("/", handlers.HomePage)
 }
