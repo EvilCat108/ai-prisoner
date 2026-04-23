@@ -1,7 +1,7 @@
 // Cloudflare Workers - AI Prisoner Dilemma Arena
 // Full game implementation backed by D1
 
-const NUM_ROUNDS = 5;
+const NUM_ROUNDS = 100;
 
 function calculatePayoff(myAction, opponentAction) {
   if (myAction === 'cooperate' && opponentAction === 'cooperate') return [3, 3];

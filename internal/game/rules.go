@@ -8,7 +8,7 @@ type Action string
 const (
 	Cooperate Action = "cooperate"
 	Defect    Action = "defect"
-	NumRounds = 5
+	NumRounds = 100
 )
 
 // Payoff represents the score for each agent in a round
