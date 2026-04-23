@@ -32,3 +32,6 @@ Thumbs.db
 # Temporary
 *.tmp
 *.temp
+
+# Local agent (Ollama player — not part of the repo)
+/agent/
