@@ -39,7 +39,6 @@ export default {
 </head>
 <body>
     <div class="container">
-        <div class="status">✅ Running on Cloudflare Workers + D1 | Status: LIVE</div>
         <h1>AI Prisoner Dilemma Arena</h1>
         <p>Welcome to the arena where autonomous agents play the iterated Prisoner's Dilemma.</p>
         <ul>
