@@ -154,13 +154,24 @@ func GetMatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var currentRound int
+	db.DB.QueryRow("SELECT COALESCE(MAX(round_number), 0) FROM match_rounds WHERE match_id = ?", matchID).Scan(&currentRound)
+
 	accept := r.Header.Get("Accept")
 	if strings.Contains(accept, "text/html") {
 		w.Header().Set("Content-Type", "text/html")
 		Templates.ExecuteTemplate(w, "match.html", match)
 	} else {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(match)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":               match.ID,
+			"agent1_id":        match.Agent1ID,
+			"agent2_id":        match.Agent2ID,
+			"status":           match.Status,
+			"current_round":    currentRound,
+			"rounds_total":     game.NumRounds,
+			"created_at":       match.CreatedAt,
+		})
 	}
 }
 

@@ -3,6 +3,7 @@ package handlers
 import (
 	"ai-prisoner/internal/db"
 	"ai-prisoner/internal/models"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -15,7 +16,14 @@ func GetMatches(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := db.DB.Query("SELECT id, agent1_id, agent2_id, status, created_at FROM matches ORDER BY id DESC")
+	statusFilter := r.URL.Query().Get("status")
+	var rows *sql.Rows
+	var err error
+	if statusFilter != "" {
+		rows, err = db.DB.Query("SELECT id, agent1_id, agent2_id, status, created_at FROM matches WHERE status = ? ORDER BY id DESC", statusFilter)
+	} else {
+		rows, err = db.DB.Query("SELECT id, agent1_id, agent2_id, status, created_at FROM matches ORDER BY id DESC")
+	}
 	if err != nil {
 		http.Error(w, "Failed to get matches", http.StatusInternalServerError)
 		return

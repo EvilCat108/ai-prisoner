@@ -15,7 +15,7 @@ func GetAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := db.DB.Query("SELECT id, name, api_key, is_active, created_at FROM agents ORDER BY id")
+	rows, err := db.DB.Query("SELECT id, name, is_active, created_at FROM agents ORDER BY id")
 	if err != nil {
 		http.Error(w, "Failed to get agents", http.StatusInternalServerError)
 		return
@@ -25,7 +25,7 @@ func GetAgents(w http.ResponseWriter, r *http.Request) {
 	var agents []models.Agent
 	for rows.Next() {
 		var agent models.Agent
-		rows.Scan(&agent.ID, &agent.Name, &agent.APIKey, &agent.IsActive, &agent.CreatedAt)
+		rows.Scan(&agent.ID, &agent.Name, &agent.IsActive, &agent.CreatedAt)
 		agents = append(agents, agent)
 	}
 
