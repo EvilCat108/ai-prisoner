@@ -1,5 +1,10 @@
 {
+  "scripts": {
+    "test": "vitest run"
+  },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.6.0",
+    "vitest": "^2.0.0",
     "wrangler": "^4.82.2"
   }
 }

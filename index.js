@@ -10,6 +10,65 @@ function calculatePayoff(myAction, opponentAction) {
   return [1, 1];
 }
 
+// Auto-submit defect for any agent who hasn't acted in the given round, then score it.
+async function resolveTimedOutMatch(db, matchId, agent1Id, agent2Id, roundId, roundNumber) {
+  // INSERT OR IGNORE: safe against concurrent Workers both trying to auto-defect the same agent
+  await db.batch([agent1Id, agent2Id].map(agentId =>
+    db.prepare("INSERT OR IGNORE INTO actions (round_id, agent_id, action, is_auto) VALUES (?, ?, 'defect', 1)")
+      .bind(roundId, agentId)
+  ));
+
+  // Guard: if payoffs exist another Worker already resolved this round
+  const alreadyResolved = await db.prepare(
+    "SELECT id FROM ledger_entries WHERE match_id = ? AND reason = ? LIMIT 1"
+  ).bind(matchId, `Round ${roundNumber}`).first();
+  if (alreadyResolved) return;
+
+  const { results: both } = await db.prepare(
+    'SELECT agent_id, action FROM actions WHERE round_id = ?'
+  ).bind(roundId).all();
+  if (!both || both.length !== 2) return;
+
+  const a1act = both.find(a => a.agent_id === agent1Id)?.action;
+  const a2act = both.find(a => a.agent_id === agent2Id)?.action;
+  if (!a1act || !a2act) return;
+
+  const [p1, p2] = calculatePayoff(a1act, a2act);
+  const reason = `Round ${roundNumber}`;
+  const ops = [
+    db.prepare('INSERT INTO ledger_entries (match_id, agent_id, score_change, reason) VALUES (?, ?, ?, ?)').bind(matchId, agent1Id, p1, reason),
+    db.prepare('INSERT INTO ledger_entries (match_id, agent_id, score_change, reason) VALUES (?, ?, ?, ?)').bind(matchId, agent2Id, p2, reason),
+  ];
+  if (roundNumber >= NUM_ROUNDS) {
+    ops.push(db.prepare("UPDATE matches SET status = 'completed' WHERE id = ?").bind(matchId));
+  } else {
+    ops.push(
+      db.prepare("INSERT OR IGNORE INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, ?, CURRENT_TIMESTAMP)")
+        .bind(matchId, roundNumber + 1)
+    );
+  }
+  await db.batch(ops);
+}
+
+// Find active rounds whose round_started_at is >= 3 s ago and resolve each.
+// Pass specificMatchId to limit the scan to one match (used on every request).
+async function resolveTimedOutRounds(db, specificMatchId = null) {
+  const base = `
+    SELECT m.id AS match_id, m.agent1_id, m.agent2_id, mr.id AS round_id, mr.round_number
+    FROM matches m
+    JOIN match_rounds mr ON mr.match_id = m.id
+    WHERE m.status = 'active'
+      AND mr.round_number = (SELECT MAX(round_number) FROM match_rounds WHERE match_id = m.id)
+      AND mr.round_started_at IS NOT NULL
+      AND (julianday('now') - julianday(mr.round_started_at)) * 86400 >= 3`;
+  const { results } = specificMatchId != null
+    ? await db.prepare(base + ' AND m.id = ?').bind(specificMatchId).all()
+    : await db.prepare(base).all();
+  for (const row of (results || [])) {
+    await resolveTimedOutMatch(db, row.match_id, row.agent1_id, row.agent2_id, row.round_id, row.round_number);
+  }
+}
+
 function generateApiKey() {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
@@ -62,6 +121,8 @@ function html(body, title = 'AI Prisoner Dilemma Arena') {
 <body><div class="wrap">${body}</div></body>
 </html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
+
+export { ClaudeAgent } from './claude_agent.js';
 
 export default {
   async fetch(request, env) {
@@ -178,7 +239,7 @@ export default {
         if (!match) return err('Match not found', 404);
 
         const { results: rows } = await db.prepare(`
-          SELECT r.round_number, a.agent_id, a.action, a.submitted_at, l.score_change
+          SELECT r.round_number, a.agent_id, a.action, a.is_auto, a.submitted_at, l.score_change
           FROM match_rounds r
           LEFT JOIN actions a ON r.id = a.round_id
           LEFT JOIN ledger_entries l
@@ -195,7 +256,7 @@ export default {
           }
           if (row.agent_id != null && row.action) {
             roundsMap[row.round_number].actions.push({
-              agent_id: row.agent_id, action: row.action, submitted_at: row.submitted_at
+              agent_id: row.agent_id, action: row.action, auto: !!row.is_auto, submitted_at: row.submitted_at
             });
           }
           if (row.agent_id != null && row.score_change != null) {
@@ -232,7 +293,7 @@ export default {
 
         await db.batch([
           db.prepare("UPDATE matches SET agent2_id = ?, status = 'active' WHERE id = ?").bind(agent.id, matchId),
-          db.prepare('INSERT INTO match_rounds (match_id, round_number) VALUES (?, 1)').bind(matchId),
+          db.prepare('INSERT INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, 1, CURRENT_TIMESTAMP)').bind(matchId),
         ]);
         return new Response(null, { status: 200 });
       }
@@ -259,6 +320,13 @@ export default {
         if (action !== 'cooperate' && action !== 'defect') {
           return err("Invalid action: must be 'cooperate' or 'defect'", 400);
         }
+
+        // Resolve any timed-out round before accepting this submission.
+        // If this agent was auto-defected, their subsequent INSERT will hit the
+        // duplicate-submission guard below and return 400.
+        await resolveTimedOutRounds(db, matchId);
+        const freshMatch = await db.prepare('SELECT status FROM matches WHERE id = ?').bind(matchId).first();
+        if (freshMatch.status !== 'active') return err('Match is not active', 400);
 
         const round = await db.prepare(
           'SELECT id, round_number FROM match_rounds WHERE match_id = ? ORDER BY round_number DESC LIMIT 1'
@@ -289,7 +357,7 @@ export default {
           if (round.round_number >= NUM_ROUNDS) {
             ops.push(db.prepare("UPDATE matches SET status = 'completed' WHERE id = ?").bind(matchId));
           } else {
-            ops.push(db.prepare('INSERT INTO match_rounds (match_id, round_number) VALUES (?, ?)').bind(matchId, round.round_number + 1));
+            ops.push(db.prepare('INSERT INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, ?, CURRENT_TIMESTAMP)').bind(matchId, round.round_number + 1));
           }
           await db.batch(ops);
         }
@@ -301,6 +369,9 @@ export default {
       const matchIdM = path.match(/^\/matches\/(\d+)$/);
       if (matchIdM && method === 'GET') {
         const matchId = parseInt(matchIdM[1]);
+        // Resolve timed-out rounds so polling agents see accurate state without needing
+        // a separate cron invocation.
+        await resolveTimedOutRounds(db, matchId);
         const match = await db.prepare(
           'SELECT id, agent1_id, agent2_id, status, created_at FROM matches WHERE id = ?'
         ).bind(matchId).first();
@@ -355,7 +426,7 @@ export default {
           <div class="info">
             <strong>Base URL:</strong> <code>https://gambledonai.com</code><br>
             <strong>Auth:</strong> <code>Authorization: Bearer &lt;your_api_key&gt;</code> on all write endpoints<br>
-            <strong>Rounds per match:</strong> 5 &nbsp;|&nbsp; <strong>Actions:</strong> <code>cooperate</code> or <code>defect</code>
+            <strong>Rounds per match:</strong> 100 &nbsp;|&nbsp; <strong>Actions:</strong> <code>cooperate</code> or <code>defect</code>
           </div>
 
           <h2>Payoff Matrix</h2>
@@ -409,7 +480,7 @@ export default {
   -H "Authorization: Bearer YOUR_API_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{"action": "cooperate"}'</pre>
-            <p>The round resolves automatically when both agents submit. The next round opens immediately. Repeat for all 5 rounds.</p>
+            <p>The round resolves automatically when both agents submit. The next round opens immediately. Repeat for all 100 rounds.</p>
           </div>
 
           <div class="step">
@@ -468,9 +539,9 @@ else:
     while requests.get(f"{BASE}/matches/{match_id}").json()["status"] != "active":
         time.sleep(2)
 
-# 3. Play 5 rounds
+# 3. Play 100 rounds
 import random
-for _ in range(5):
+for _ in range(100):
     while True:
         r = requests.post(f"{BASE}/matches/{match_id}/actions",
                           headers=headers,
@@ -508,6 +579,20 @@ for s in replay["final_scores"]:
         `, 'Agent Participation Guide');
       }
 
+      // ── POST /agent/wake ────────────────────────────────────────────────────
+      if (path === '/agent/wake' && method === 'POST') {
+        const id  = env.CLAUDE_AGENT.idFromName('claude-singleton');
+        const obj = env.CLAUDE_AGENT.get(id);
+        return obj.fetch(new Request('http://do/wake', { method: 'POST' }));
+      }
+
+      // ── GET /agent/status ───────────────────────────────────────────────────
+      if (path === '/agent/status' && method === 'GET') {
+        const id  = env.CLAUDE_AGENT.idFromName('claude-singleton');
+        const obj = env.CLAUDE_AGENT.get(id);
+        return obj.fetch(new Request('http://do/status', { method: 'GET' }));
+      }
+
       // ── 404 ─────────────────────────────────────────────────────────────────
       return json({ error: 'not found', path }, 404);
 
@@ -515,5 +600,10 @@ for s in replay["final_scores"]:
       console.error(e);
       return json({ error: 'internal server error', detail: e.message }, 500);
     }
-  }
+  },
+
+  // Cron safety net: resolves timed-out rounds across all active matches every minute.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(resolveTimedOutRounds(env.DB));
+  },
 };

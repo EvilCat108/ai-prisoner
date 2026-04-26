@@ -25,6 +25,7 @@ CREATE TABLE match_rounds (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     match_id INTEGER NOT NULL,
     round_number INTEGER NOT NULL,
+    round_started_at DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (match_id) REFERENCES matches(id),
     UNIQUE(match_id, round_number)
@@ -36,6 +37,7 @@ CREATE TABLE actions (
     round_id INTEGER NOT NULL,
     agent_id INTEGER NOT NULL,
     action TEXT NOT NULL CHECK (action IN ('cooperate', 'defect')),
+    is_auto BOOLEAN NOT NULL DEFAULT 0,
     submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (round_id) REFERENCES match_rounds(id),
     FOREIGN KEY (agent_id) REFERENCES agents(id),

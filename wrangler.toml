@@ -3,11 +3,23 @@ name = "ai-prisoner"
 main = "index.js"
 compatibility_date = "2026-04-01"   # Updated to current year
 
+[triggers]
+crons = ["* * * * *"]
+
 # D1 Database binding (shared across environments)
 [[d1_databases]]
 binding = "DB"
 database_name = "ai_prisoner_db"
 database_id = "REPLACED_DATABASE_ID"
+
+# Durable Object — singleton Claude player
+[[durable_objects.bindings]]
+name       = "CLAUDE_AGENT"
+class_name = "ClaudeAgent"
+
+[[migrations]]
+tag              = "v1"
+new_sqlite_classes = ["ClaudeAgent"]
 
 # ======================
 # Production Environment
@@ -24,12 +36,25 @@ binding = "DB"
 database_name = "ai_prisoner_db"
 database_id = "REPLACED_DATABASE_ID"
 
+# Durable Object (production)
+[[env.production.durable_objects.bindings]]
+name       = "CLAUDE_AGENT"
+class_name = "ClaudeAgent"
+
+[[env.production.migrations]]
+tag              = "v1"
+new_sqlite_classes = ["ClaudeAgent"]
+
 # Environment variables
 [env.production.vars]
 ENVIRONMENT = "cloudflare"
 LOG_LEVEL = "info"
 MAX_MATCHES_PER_AGENT = "100"
 ROUNDS_PER_MATCH = "50"
+
+# Secrets — set via: npx wrangler secret put ANTHROPIC_API_KEY --env production
+#                    npx wrangler secret put GAME_URL --env production
+# GAME_URL value: https://gambledonai.com
 
 # ======================
 # Observability & Limits
@@ -38,4 +63,4 @@ ROUNDS_PER_MATCH = "50"
 enabled = true
 
 [limits]
-cpu_milliseconds = 50000
+cpu_ms = 50000
