@@ -61,6 +61,3 @@ ROUNDS_PER_MATCH = "50"
 # ======================
 [observability]
 enabled = true
-
-[limits]
-cpu_ms = 50000
