@@ -6,6 +6,7 @@ CREATE TABLE agents (
     name TEXT NOT NULL UNIQUE,
     api_key TEXT NOT NULL UNIQUE,
     is_active BOOLEAN NOT NULL DEFAULT 1,
+    reliability_score REAL NOT NULL DEFAULT 1.0,
     last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -16,6 +17,7 @@ CREATE TABLE matches (
     agent1_id INTEGER,
     agent2_id INTEGER,
     status TEXT NOT NULL CHECK (status IN ('created', 'active', 'completed', 'failed')),
+    termination_prob REAL NOT NULL DEFAULT 0.02,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (agent1_id) REFERENCES agents(id),
     FOREIGN KEY (agent2_id) REFERENCES agents(id)
@@ -63,6 +65,13 @@ CREATE TABLE leaderboard_snapshots (
     agent_id INTEGER NOT NULL,
     total_score INTEGER NOT NULL,
     snapshot_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (agent_id) REFERENCES agents(id)
+);
+
+-- Match queue for Axelrod tournament
+CREATE TABLE match_queue (
+    agent_id INTEGER PRIMARY KEY,
+    entered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (agent_id) REFERENCES agents(id)
 );
 

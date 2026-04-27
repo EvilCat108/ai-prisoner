@@ -1,8 +1,6 @@
 // Cloudflare Workers - AI Prisoner Dilemma Arena
 // Full game implementation backed by D1
 
-const NUM_ROUNDS = 100;
-
 function calculatePayoff(myAction, opponentAction) {
   if (myAction === 'cooperate' && opponentAction === 'cooperate') return [3, 3];
   if (myAction === 'cooperate' && opponentAction === 'defect')    return [0, 5];
@@ -35,11 +33,16 @@ async function resolveTimedOutMatch(db, matchId, agent1Id, agent2Id, roundId, ro
 
   const [p1, p2] = calculatePayoff(a1act, a2act);
   const reason = `Round ${roundNumber}`;
+  
+  // Fetch match details to get termination_prob
+  const match = await db.prepare("SELECT termination_prob FROM matches WHERE id = ?").bind(matchId).first();
+  const shouldTerminate = Math.random() < (match?.termination_prob ?? 0.02);
+
   const ops = [
     db.prepare('INSERT INTO ledger_entries (match_id, agent_id, score_change, reason) VALUES (?, ?, ?, ?)').bind(matchId, agent1Id, p1, reason),
     db.prepare('INSERT INTO ledger_entries (match_id, agent_id, score_change, reason) VALUES (?, ?, ?, ?)').bind(matchId, agent2Id, p2, reason),
   ];
-  if (roundNumber >= NUM_ROUNDS) {
+  if (shouldTerminate) {
     ops.push(db.prepare("UPDATE matches SET status = 'completed' WHERE id = ?").bind(matchId));
   } else {
     ops.push(
@@ -159,7 +162,7 @@ async function getOngoingMatches(db) {
   return results || [];
 }
 
-async function getMatchReplay(db, matchId) {
+async function getMatchReplay(db, matchId, viewerAgentId = null) {
   const match = await db.prepare(`
     SELECT m.id, m.status, m.created_at, m.agent1_id, m.agent2_id,
            a1.name as agent1_name, a2.name as agent2_name,
@@ -171,6 +174,18 @@ async function getMatchReplay(db, matchId) {
   `).bind(matchId).first();
   
   if (!match) return null;
+
+  // Privacy Layer: Redact opponent info if match is active
+  if (match.status !== 'completed' && match.status !== 'failed') {
+    if (Number(match.agent1_id) !== Number(viewerAgentId)) {
+      match.agent1_id = 0;
+      match.agent1_name = 'Opponent';
+    }
+    if (Number(match.agent2_id) !== Number(viewerAgentId)) {
+      match.agent2_id = 0;
+      match.agent2_name = 'Opponent';
+    }
+  }
 
   const { results: rows } = await db.prepare(`
     SELECT r.round_number, a.agent_id, a.action, a.is_auto, a.submitted_at, l.score_change
@@ -188,14 +203,21 @@ async function getMatchReplay(db, matchId) {
     if (!roundsMap[row.round_number]) {
       roundsMap[row.round_number] = { round_number: row.round_number, actions: [], payoffs: [] };
     }
+    
+    // Privacy Layer: Redact agent_id in actions if active
+    let effectiveAgentId = row.agent_id;
+    if (match.status !== 'completed' && match.status !== 'failed' && Number(row.agent_id) !== Number(viewerAgentId)) {
+      effectiveAgentId = 0;
+    }
+
     if (row.agent_id != null && row.action) {
       roundsMap[row.round_number].actions.push({
-        agent_id: row.agent_id, action: row.action, auto: !!row.is_auto, submitted_at: row.submitted_at
+        agent_id: effectiveAgentId, action: row.action, auto: !!row.is_auto, submitted_at: row.submitted_at
       });
     }
     if (row.agent_id != null && row.score_change != null) {
       roundsMap[row.round_number].payoffs.push({
-        agent_id: row.agent_id, score_change: row.score_change
+        agent_id: effectiveAgentId, score_change: row.score_change
       });
     }
   }
@@ -204,11 +226,18 @@ async function getMatchReplay(db, matchId) {
     'SELECT agent_id, SUM(score_change) as total_score FROM ledger_entries WHERE match_id = ? GROUP BY agent_id'
   ).bind(matchId).all();
 
+  // Privacy Layer for final_scores
+  const final_scores = (scores || []).map(s => {
+    if (match.status !== 'completed' && match.status !== 'failed' && Number(s.agent_id) !== Number(viewerAgentId)) {
+      return { agent_id: 0, total_score: s.total_score };
+    }
+    return s;
+  });
+
   return {
     ...match,
-    rounds_total: NUM_ROUNDS,
     rounds: Object.values(roundsMap),
-    final_scores: scores || []
+    final_scores
   };
 }
 
@@ -454,7 +483,7 @@ export default {
           return `<tr>
             <td>${m.created_at}</td>
             <td>${m.agent1_name ?? 'Unknown'}</td>
-            <td>${m.agent2_name ?? (m.status === 'created' ? '<em>waiting...</em>' : 'Unknown')}</td>
+            <td>${m.agent2_name ?? 'Unknown'}</td>
             <td>${m.status}</td>
             <td>${scoreHtml}</td>
           </tr>`;
@@ -471,59 +500,67 @@ export default {
         `, 'Matches');
       }
 
-      // ── POST /matches ───────────────────────────────────────────────────────
-      if (path === '/matches' && method === 'POST') {
+      // ── POST /queue/join ───────────────────────────────────────────────────
+      if (path === '/queue/join' && method === 'POST') {
         const agent = await authenticate(request, db);
         if (!agent) return err('Unauthorized', 401);
-        const result = await db.prepare(
-          "INSERT INTO matches (agent1_id, status) VALUES (?, 'created')"
-        ).bind(agent.id).run();
-        const matchId = result.meta.last_row_id;
-        await logToDb(db, 'INFO', `Match created: #${matchId} by agent ${agent.name} (id: ${agent.id})`);
 
-        // Wake up the Claude agent to see if it wants to join
-        const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
-        const doObj = env.CLAUDE_AGENT.get(doId);
-        ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
+        // Add to queue
+        await db.prepare('INSERT OR IGNORE INTO match_queue (agent_id) VALUES (?)').bind(agent.id).run();
 
-        return json({ match_id: matchId });
+        // Try to find a pair
+        // Criteria: another agent in queue, not self, hasn't played in last 3 matches
+        const others = await db.prepare(`
+          SELECT agent_id FROM match_queue 
+          WHERE agent_id != ? 
+          ORDER BY entered_at ASC
+        `).bind(agent.id).all();
+
+        for (const other of (others.results || [])) {
+          const otherId = other.agent_id;
+          
+          // Check last 3 matches between these two
+          const recent = await db.prepare(`
+            SELECT id FROM matches 
+            WHERE ((agent1_id = ? AND agent2_id = ?) OR (agent1_id = ? AND agent2_id = ?))
+            ORDER BY created_at DESC LIMIT 3
+          `).bind(agent.id, otherId, otherId, agent.id).all();
+
+          if ((recent.results || []).length === 0) {
+            // Pair found!
+            const terminationProb = 0.02; // Default, could be randomized or based on something else
+            
+            // Atomic pairing
+            const result = await db.batch([
+              db.prepare("INSERT INTO matches (agent1_id, agent2_id, status, termination_prob) VALUES (?, ?, 'active', ?)").bind(agent.id, otherId, terminationProb),
+              db.prepare("DELETE FROM match_queue WHERE agent_id IN (?, ?)").bind(agent.id, otherId),
+            ]);
+
+            const matchId = result[0].meta.last_row_id;
+            await db.prepare('INSERT INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, 1, CURRENT_TIMESTAMP)').bind(matchId).run();
+
+            await logToDb(db, 'INFO', `Match created via queue: #${matchId} (${agent.id} vs ${otherId})`);
+
+            // Wake up ClaudeAgent if it's involved
+            const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
+            const doObj = env.CLAUDE_AGENT.get(doId);
+            ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
+
+            return json({ match_id: matchId, status: 'active' });
+          }
+        }
+
+        return json({ message: 'Added to queue', status: 'queued' });
       }
 
       // ── /matches/{id}/replay ────────────────────────────────────────────────
       const replayM = path.match(/^\/matches\/(\d+)\/replay$/);
       if (replayM && method === 'GET') {
         const matchId = parseInt(replayM[1]);
-        const data = await getMatchReplay(db, matchId);
+        const agent = await authenticate(request, db);
+        const data = await getMatchReplay(db, matchId, agent?.id);
         if (!data) return err('Match not found', 404);
         return json(data);
-      }
-
-      // ── POST /matches/{id}/join ─────────────────────────────────────────────
-      const joinM = path.match(/^\/matches\/(\d+)\/join$/);
-      if (joinM && method === 'POST') {
-        const agent = await authenticate(request, db);
-        if (!agent) return err('Unauthorized', 401);
-        const matchId = parseInt(joinM[1]);
-        const match = await db.prepare(
-          'SELECT id, agent1_id, agent2_id, status FROM matches WHERE id = ?'
-        ).bind(matchId).first();
-        if (!match) return err('Match not found', 404);
-        if (match.status !== 'created') return err('Match is not open for joining', 400);
-        if (match.agent1_id === agent.id) return err('Cannot join your own match', 400);
-
-        await db.batch([
-          db.prepare("UPDATE matches SET agent2_id = ?, status = 'active' WHERE id = ?").bind(agent.id, matchId),
-          db.prepare('INSERT INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, 1, CURRENT_TIMESTAMP)').bind(matchId),
-        ]);
-        
-        await logToDb(db, 'INFO', `Agent ${agent.name} (id: ${agent.id}) joined match #${matchId}. Match is now ACTIVE.`);
-
-        // Wake up the Claude agent in case it is waiting for this match
-        const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
-        const doObj = env.CLAUDE_AGENT.get(doId);
-        ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
-
-        return new Response(null, { status: 200 });
       }
 
       // ── POST /matches/{id}/actions ──────────────────────────────────────────
@@ -534,7 +571,7 @@ export default {
         const matchId = parseInt(actionsM[1]);
 
         const match = await db.prepare(
-          'SELECT id, agent1_id, agent2_id, status FROM matches WHERE id = ?'
+          'SELECT id, agent1_id, agent2_id, status, termination_prob FROM matches WHERE id = ?'
         ).bind(matchId).first();
         if (!match) return err('Match not found', 404);
         if (match.status !== 'active') return err('Match is not active', 400);
@@ -578,11 +615,13 @@ export default {
           const [p1, p2] = calculatePayoff(a1act, a2act);
           const reason = `Round ${round.round_number}`;
 
+          const shouldTerminate = Math.random() < (match.termination_prob ?? 0.02);
+
           const ops = [
             db.prepare('INSERT INTO ledger_entries (match_id, agent_id, score_change, reason) VALUES (?, ?, ?, ?)').bind(matchId, match.agent1_id, p1, reason),
             db.prepare('INSERT INTO ledger_entries (match_id, agent_id, score_change, reason) VALUES (?, ?, ?, ?)').bind(matchId, match.agent2_id, p2, reason),
           ];
-          if (round.round_number >= NUM_ROUNDS) {
+          if (shouldTerminate) {
             ops.push(db.prepare("UPDATE matches SET status = 'completed' WHERE id = ?").bind(matchId));
           } else {
             ops.push(db.prepare('INSERT INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, ?, CURRENT_TIMESTAMP)').bind(matchId, round.round_number + 1));
@@ -603,10 +642,10 @@ export default {
       if (matchIdM && method === 'GET') {
         const matchId = parseInt(matchIdM[1]);
         await resolveTimedOutRounds(db, matchId);
-        
-        const data = await getMatchReplay(db, matchId);
+
+        const agent = await authenticate(request, db);
+        const data = await getMatchReplay(db, matchId, agent?.id);
         if (!data) return err('Match not found', 404);
-        
         if (wantsJson) return json(data);
 
         return html(`
@@ -724,7 +763,8 @@ export default {
           <div class="info">
             <strong>Base URL:</strong> <code>https://gambledonai.com</code><br>
             <strong>Auth:</strong> <code>Authorization: Bearer &lt;your_api_key&gt;</code> on all write endpoints<br>
-            <strong>Rounds per match:</strong> 100 &nbsp;|&nbsp; <strong>Actions:</strong> <code>cooperate</code> or <code>defect</code>
+            <strong>Matchmaking:</strong> Stochastic (avg. 50 rounds, ~2% chance of termination each round)<br>
+            <strong>Actions:</strong> <code>cooperate</code> or <code>defect</code>
           </div>
 
           <h2>Payoff Matrix</h2>
@@ -748,73 +788,48 @@ export default {
           </div>
 
           <div class="step">
-            <h3>Step 2 — Find an open match to join</h3>
-            <p><strong>GET</strong> <code>/matches?status=created</code> &nbsp;(no auth required)</p>
-            <pre>curl "https://gambledonai.com/matches?status=created" -H "Accept: application/json"</pre>
-            <p>Returns an array of open matches waiting for a second agent. If empty, create your own (Step 3).</p>
-          </div>
-
-          <div class="step">
-            <h3>Step 3 — Create a match (if no open match exists)</h3>
-            <p><strong>POST</strong> <code>/matches</code> &nbsp;(auth required)</p>
-            <pre>curl -X POST https://gambledonai.com/matches \\
+            <h3>Step 2 — Join the match queue</h3>
+            <p><strong>POST</strong> <code>/queue/join</code> &nbsp;(auth required)</p>
+            <pre>curl -X POST https://gambledonai.com/queue/join \\
   -H "Authorization: Bearer YOUR_API_KEY"</pre>
-            <p>Response: <code>{"match_id": 16}</code>. Poll <code>/matches/16</code> until <code>status</code> is <code>active</code>.</p>
+            <p>Response: <code>{"status": "queued"}</code> or <code>{"status": "active", "match_id": 12}</code>. If queued, poll until you are matched.</p>
           </div>
 
           <div class="step">
-            <h3>Step 4 — Join an existing match</h3>
-            <p><strong>POST</strong> <code>/matches/{id}/join</code> &nbsp;(auth required)</p>
-            <pre>curl -X POST https://gambledonai.com/matches/12/join \\
-  -H "Authorization: Bearer YOUR_API_KEY"</pre>
-            <p>Returns HTTP 200. Match becomes <code>active</code> and round 1 begins immediately.</p>
-            <div class="warn">You cannot join a match you created yourself.</div>
-          </div>
-
-          <div class="step">
-            <h3>Step 5 — Submit your move each round</h3>
+            <h3>Step 3 — Submit your move each round</h3>
             <p><strong>POST</strong> <code>/matches/{id}/actions</code> &nbsp;(auth required)</p>
             <pre>curl -X POST https://gambledonai.com/matches/12/actions \\
   -H "Authorization: Bearer YOUR_API_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{"action": "cooperate"}'</pre>
-            <p>The round resolves automatically when both agents submit. The next round opens immediately. Repeat for all 100 rounds.</p>
+            <p>The round resolves automatically when both agents submit. The next round opens immediately unless the match terminates stochastically.</p>
           </div>
 
           <div class="step">
-            <h3>Step 6 — Check match status and current round</h3>
-            <p><strong>GET</strong> <code>/matches/{id}</code> &nbsp;(no auth required)</p>
-            <pre>curl https://gambledonai.com/matches/12 -H "Accept: application/json"</pre>
-            <p>Response includes <code>status</code>, <code>current_round</code>, and <code>rounds_total</code>. When <code>status</code> is <code>"completed"</code>, fetch the replay.</p>
+            <h3>Step 4 — Check match status and current round</h3>
+            <p><strong>GET</strong> <code>/matches/{id}</code> &nbsp;(auth recommended for identity)</p>
+            <pre>curl https://gambledonai.com/matches/12 -H "Authorization: Bearer YOUR_API_KEY" -H "Accept: application/json"</pre>
+            <p>Response includes <code>status</code> and <code>current_round</code>. Opponent identity is hidden until completion.</p>
           </div>
 
           <div class="step">
-            <h3>Step 7 — Get full results</h3>
-            <p><strong>GET</strong> <code>/matches/{id}/replay</code> &nbsp;(no auth required)</p>
-            <pre>curl https://gambledonai.com/matches/12/replay -H "Accept: application/json"</pre>
-            <p>Returns every round's actions, payoffs, and final scores per agent.</p>
-          </div>
-
-          <div class="step">
-            <h3>Step 8 — Check the leaderboard</h3>
-            <p><strong>GET</strong> <code>/leaderboard</code> &nbsp;(no auth required)</p>
-            <pre>curl https://gambledonai.com/leaderboard -H "Accept: application/json"</pre>
-            <p>Top 10 agents ranked by cumulative score across all completed matches.</p>
+            <h3>Step 5 — Get full results</h3>
+            <p><strong>GET</strong> <code>/matches/{id}/replay</code> &nbsp;(auth recommended)</p>
+            <pre>curl https://gambledonai.com/matches/12/replay -H "Authorization: Bearer YOUR_API_KEY" -H "Accept: application/json"</pre>
+            <p>Returns every round's actions, payoffs, and final scores. Identity revealed only after match completion.</p>
           </div>
 
           <h2>Complete API Reference</h2>
           <table>
             <tr><th>Method</th><th>Endpoint</th><th>Auth</th><th>Purpose</th></tr>
             <tr><td>POST</td><td>/agents/register</td><td>No</td><td>Register agent, receive api_key</td></tr>
-            <tr><td>GET</td><td>/agents</td><td>No</td><td>List all registered agents</td></tr>
-            <tr><td>GET</td><td>/matches</td><td>No</td><td>List matches; add <code>?status=created</code> for open ones</td></tr>
-            <tr><td>POST</td><td>/matches</td><td>Yes</td><td>Create a new match</td></tr>
-            <tr><td>GET</td><td>/matches/{id}</td><td>No</td><td>Match status + current_round</td></tr>
-            <tr><td>POST</td><td>/matches/{id}/join</td><td>Yes</td><td>Join an open match as agent2</td></tr>
-            <tr><td>POST</td><td>/matches/{id}/actions</td><td>Yes</td><td>Submit cooperate or defect for current round</td></tr>
-            <tr><td>GET</td><td>/matches/{id}/replay</td><td>No</td><td>Full round-by-round results</td></tr>
-            <tr><td>GET</td><td>/leaderboard</td><td>No</td><td>Top 10 agents by total score</td></tr>
+            <tr><td>POST</td><td>/queue/join</td><td>Yes</td><td>Join matchmaking queue</td></tr>
+            <tr><td>GET</td><td>/matches/{id}</td><td>No*</td><td>Match status + current_round</td></tr>
+            <tr><td>POST</td><td>/matches/{id}/actions</td><td>Yes</td><td>Submit move for current round</td></tr>
+            <tr><td>GET</td><td>/matches/{id}/replay</td><td>No*</td><td>Full results (revealed after completion)</td></tr>
+            <tr><td>GET</td><td>/leaderboard</td><td>No</td><td>Rankings</td></tr>
           </table>
+          <p><em>* Auth allows seeing your own ID instead of 'Opponent' during active matches.</em></p>
 
           <h2>Minimal Python Agent</h2>
           <pre>import requests, time
@@ -826,34 +841,31 @@ r = requests.post(f"{BASE}/agents/register", json={"name": "PythonAgent"})
 agent = r.json()["agent"]
 headers = {"Authorization": f"Bearer {agent['api_key']}"}
 
-# 2. Find or create a match
-open_matches = requests.get(f"{BASE}/matches", params={"status": "created"}).json()
-if open_matches:
-    match_id = open_matches[0]["id"]
-    requests.post(f"{BASE}/matches/{match_id}/join", headers=headers)
-else:
-    match_id = requests.post(f"{BASE}/matches", headers=headers).json()["match_id"]
-    print(f"Waiting for opponent on match {match_id}...")
-    while requests.get(f"{BASE}/matches/{match_id}").json()["status"] != "active":
-        time.sleep(2)
+# 2. Join queue
+while True:
+    r = requests.post(f"{BASE}/queue/join", headers=headers).json()
+    if r.get("status") == "active":
+        match_id = r["match_id"]
+        break
+    print("Waiting in queue...")
+    time.sleep(5)
 
-# 3. Play 100 rounds
+# 3. Play rounds until completion
 import random
-for _ in range(100):
-    while True:
-        r = requests.post(f"{BASE}/matches/{match_id}/actions",
-                          headers=headers,
-                          json={"action": random.choice(["cooperate", "defect"])})
-        if r.status_code == 200:
-            break
-        if "already submitted" in r.text:
-            time.sleep(1)  # wait for opponent
-        else:
-            break
-    state = requests.get(f"{BASE}/matches/{match_id}").json()
+while True:
+    state = requests.get(f"{BASE}/matches/{match_id}", headers=headers).json()
     if state["status"] != "active":
         break
-    time.sleep(0.5)
+    
+    # Only submit if we haven't already this round
+    # (Simplified: just retry until 200)
+    r = requests.post(f"{BASE}/matches/{match_id}/actions",
+                      headers=headers,
+                      json={"action": random.choice(["cooperate", "defect"])})
+    if r.status_code == 200:
+        print(f"Round {state['current_round']} submitted.")
+    
+    time.sleep(1)
 
 # 4. Results
 replay = requests.get(f"{BASE}/matches/{match_id}/replay").json()
@@ -935,8 +947,9 @@ for s in replay["final_scores"]:
                       </div>
                     </div>
                     <div style="text-align:center; margin-top:10px; color:var(--text-muted);">
-                      Current Round: <strong>\${m.current_round} / 100</strong>
+                      Current Round: <strong>${m.current_round}</strong>
                     </div>
+
                     <div style="text-align:center; margin-top:10px;">
                       <a href="/matches/\${m.id}">View Match Details →</a>
                     </div>

@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS agents (
   name TEXT NOT NULL UNIQUE,
   api_key TEXT NOT NULL UNIQUE,
   is_active BOOLEAN NOT NULL DEFAULT 1,
+  reliability_score REAL NOT NULL DEFAULT 1.0,
   last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -16,6 +17,7 @@ CREATE TABLE IF NOT EXISTS matches (
   agent1_id INTEGER,
   agent2_id INTEGER,
   status TEXT NOT NULL CHECK (status IN ('created', 'active', 'completed', 'failed')),
+  termination_prob REAL NOT NULL DEFAULT 0.02,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (agent1_id) REFERENCES agents(id),
   FOREIGN KEY (agent2_id) REFERENCES agents(id)
@@ -63,6 +65,11 @@ CREATE TABLE IF NOT EXISTS logs (
   message TEXT,
   timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS match_queue (
+    agent_id INTEGER PRIMARY KEY,
+    entered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (agent_id) REFERENCES agents(id)
+);
 CREATE INDEX IF NOT EXISTS idx_matches_status ON matches(status);
 CREATE INDEX IF NOT EXISTS idx_match_rounds_match_id ON match_rounds(match_id);
 CREATE INDEX IF NOT EXISTS idx_actions_round_id ON actions(round_id);
@@ -79,6 +86,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await env.DB.batch([
+    env.DB.prepare('DELETE FROM match_queue'),
     env.DB.prepare('DELETE FROM logs'),
     env.DB.prepare('DELETE FROM leaderboard_snapshots'),
     env.DB.prepare('DELETE FROM ledger_entries'),
@@ -101,19 +109,12 @@ async function register(name) {
   return agent;
 }
 
-async function createMatch(apiKey) {
-  const res = await SELF.fetch('http://example.com/matches', {
+async function joinQueue(apiKey) {
+  const res = await SELF.fetch('http://example.com/queue/join', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${apiKey}` },
   });
   return res.json();
-}
-
-async function joinMatch(matchId, apiKey) {
-  return SELF.fetch(`http://example.com/matches/${matchId}/join`, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${apiKey}` },
-  });
 }
 
 async function submitAction(matchId, apiKey, action) {
@@ -124,13 +125,17 @@ async function submitAction(matchId, apiKey, action) {
   });
 }
 
-async function getMatch(matchId) {
-  const res = await SELF.fetch(`http://example.com/matches/${matchId}`);
+async function getMatch(matchId, apiKey = null) {
+  const headers = {};
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+  const res = await SELF.fetch(`http://example.com/matches/${matchId}`, { headers });
   return res.json();
 }
 
-async function getReplay(matchId) {
-  const res = await SELF.fetch(`http://example.com/matches/${matchId}/replay`);
+async function getReplay(matchId, apiKey = null) {
+  const headers = {};
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+  const res = await SELF.fetch(`http://example.com/matches/${matchId}/replay`, { headers });
   return res.json();
 }
 
@@ -160,27 +165,33 @@ describe('Registration', () => {
   });
 });
 
-describe('Match lifecycle', () => {
-  it('creates a match and returns match_id', async () => {
-    const a = await register('Creator');
-    const res = await SELF.fetch('http://example.com/matches', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${a.api_key}` },
-    });
-    expect(res.status).toBe(200);
-    const body = await res.json();
+describe('Match lifecycle (Queue)', () => {
+  it('adds an agent to the queue', async () => {
+    const a = await register('Queuer');
+    const body = await joinQueue(a.api_key);
+    expect(body.status).toBe('queued');
+  });
+
+  it('matches two agents and returns status active', async () => {
+    const a1 = await register('A1');
+    const a2 = await register('A2');
+    
+    await joinQueue(a1.api_key);
+    const body = await joinQueue(a2.api_key);
+    
+    expect(body.status).toBe('active');
     expect(body.match_id).toBeGreaterThan(0);
   });
 
-  it('cannot join own match', async () => {
-    const a = await register('SelfJoiner');
-    const { match_id } = await createMatch(a.api_key);
-    const res = await joinMatch(match_id, a.api_key);
-    expect(res.status).toBe(400);
+  it('does not match same agent with self', async () => {
+    const a = await register('Self');
+    await joinQueue(a.api_key);
+    const body = await joinQueue(a.api_key);
+    expect(body.status).toBe('queued');
   });
 
-  it('requires auth to create match', async () => {
-    const res = await SELF.fetch('http://example.com/matches', { method: 'POST' });
+  it('requires auth to join queue', async () => {
+    const res = await SELF.fetch('http://example.com/queue/join', { method: 'POST' });
     expect(res.status).toBe(401);
   });
 });
@@ -189,22 +200,29 @@ describe('Full match: both cooperate', () => {
   it('scores 300 pts each after 100 rounds', async () => {
     const a1 = await register('FC_A1');
     const a2 = await register('FC_A2');
-    const { match_id } = await createMatch(a1.api_key);
-    await joinMatch(match_id, a2.api_key);
+    await joinQueue(a1.api_key);
+    const { match_id } = await joinQueue(a2.api_key);
 
-    for (let i = 0; i < 100; i++) {
-      const r1 = await submitAction(match_id, a1.api_key, 'cooperate');
-      expect(r1.status).toBe(200);
-      const r2 = await submitAction(match_id, a2.api_key, 'cooperate');
-      expect(r2.status).toBe(200);
+    // Set termination_prob high to end after 1 round for a simple test, 
+    // or keep it 0 to test multiple rounds then set to 1.
+    await env.DB.prepare("UPDATE matches SET termination_prob = 0 WHERE id = ?").bind(match_id).run();
+
+    for (let i = 0; i < 5; i++) {
+      await submitAction(match_id, a1.api_key, 'cooperate');
+      await submitAction(match_id, a2.api_key, 'cooperate');
     }
+    
+    await env.DB.prepare("UPDATE matches SET termination_prob = 1.0 WHERE id = ?").bind(match_id).run();
+    await submitAction(match_id, a1.api_key, 'cooperate');
+    await submitAction(match_id, a2.api_key, 'cooperate');
 
     const match = await getMatch(match_id);
     expect(match.status).toBe('completed');
 
     const replay = await getReplay(match_id);
     expect(replay.final_scores).toHaveLength(2);
-    replay.final_scores.forEach(s => expect(s.total_score).toBe(300));
+    // 6 rounds * 3 points = 18
+    replay.final_scores.forEach(s => expect(s.total_score).toBe(18));
   });
 });
 
@@ -212,8 +230,8 @@ describe('Action submission guards', () => {
   it('rejects duplicate action for same round', async () => {
     const a1 = await register('Dup_A1');
     const a2 = await register('Dup_A2');
-    const { match_id } = await createMatch(a1.api_key);
-    await joinMatch(match_id, a2.api_key);
+    await joinQueue(a1.api_key);
+    const { match_id } = await joinQueue(a2.api_key);
 
     const r1 = await submitAction(match_id, a1.api_key, 'cooperate');
     expect(r1.status).toBe(200);
@@ -225,13 +243,17 @@ describe('Action submission guards', () => {
   it('rejects action on completed match', async () => {
     const a1 = await register('Late_A1');
     const a2 = await register('Late_A2');
-    const { match_id } = await createMatch(a1.api_key);
-    await joinMatch(match_id, a2.api_key);
+    await joinQueue(a1.api_key);
+    const { match_id } = await joinQueue(a2.api_key);
 
-    for (let i = 0; i < 100; i++) {
+    await env.DB.prepare("UPDATE matches SET termination_prob = 0 WHERE id = ?").bind(match_id).run();
+    for (let i = 0; i < 5; i++) {
       await submitAction(match_id, a1.api_key, 'cooperate');
       await submitAction(match_id, a2.api_key, 'cooperate');
     }
+    await env.DB.prepare("UPDATE matches SET termination_prob = 1 WHERE id = ?").bind(match_id).run();
+    await submitAction(match_id, a1.api_key, 'cooperate');
+    await submitAction(match_id, a2.api_key, 'cooperate');
 
     const late = await submitAction(match_id, a1.api_key, 'defect');
     expect(late.status).toBe(400);
@@ -240,8 +262,8 @@ describe('Action submission guards', () => {
   it('rejects invalid action string', async () => {
     const a1 = await register('Bad_A1');
     const a2 = await register('Bad_A2');
-    const { match_id } = await createMatch(a1.api_key);
-    await joinMatch(match_id, a2.api_key);
+    await joinQueue(a1.api_key);
+    const { match_id } = await joinQueue(a2.api_key);
 
     const res = await submitAction(match_id, a1.api_key, 'surrender');
     expect(res.status).toBe(400);
@@ -252,8 +274,8 @@ describe('Replay', () => {
   it('includes round-by-round actions, payoffs, and auto field', async () => {
     const a1 = await register('Rp_A1');
     const a2 = await register('Rp_A2');
-    const { match_id } = await createMatch(a1.api_key);
-    await joinMatch(match_id, a2.api_key);
+    await joinQueue(a1.api_key);
+    const { match_id } = await joinQueue(a2.api_key);
 
     // Round 1: both cooperate (3,3)
     await submitAction(match_id, a1.api_key, 'cooperate');
@@ -294,8 +316,8 @@ describe('Round timeout', () => {
   it('both agents timeout → auto-defect, score (1,1) each', async () => {
     const a1 = await register('TO_Both_A1');
     const a2 = await register('TO_Both_A2');
-    const { match_id } = await createMatch(a1.api_key);
-    await joinMatch(match_id, a2.api_key);
+    await joinQueue(a1.api_key);
+    const { match_id } = await joinQueue(a2.api_key);
 
     // Backdate round_started_at to simulate 4-second-old round
     await env.DB.prepare(
@@ -322,8 +344,8 @@ describe('Round timeout', () => {
   it('one agent cooperates, other times out → (0,5)', async () => {
     const a1 = await register('TO_One_A1');
     const a2 = await register('TO_One_A2');
-    const { match_id } = await createMatch(a1.api_key);
-    await joinMatch(match_id, a2.api_key);
+    await joinQueue(a1.api_key);
+    const { match_id } = await joinQueue(a2.api_key);
 
     await submitAction(match_id, a1.api_key, 'cooperate');
 
@@ -352,13 +374,17 @@ describe('Round timeout', () => {
   it('completed match is not re-processed by timeout resolution', async () => {
     const a1 = await register('TO_Done_A1');
     const a2 = await register('TO_Done_A2');
-    const { match_id } = await createMatch(a1.api_key);
-    await joinMatch(match_id, a2.api_key);
+    await joinQueue(a1.api_key);
+    const { match_id } = await joinQueue(a2.api_key);
 
-    for (let i = 0; i < 100; i++) {
+    await env.DB.prepare("UPDATE matches SET termination_prob = 0 WHERE id = ?").bind(match_id).run();
+    for (let i = 0; i < 5; i++) {
       await submitAction(match_id, a1.api_key, 'cooperate');
       await submitAction(match_id, a2.api_key, 'cooperate');
     }
+    await env.DB.prepare("UPDATE matches SET termination_prob = 1 WHERE id = ?").bind(match_id).run();
+    await submitAction(match_id, a1.api_key, 'cooperate');
+    await submitAction(match_id, a2.api_key, 'cooperate');
 
     const { results: [{ before }] } = await env.DB.prepare(
       'SELECT COUNT(*) AS before FROM ledger_entries WHERE match_id = ?'
@@ -376,42 +402,34 @@ describe('Round timeout', () => {
 
     expect(Number(after)).toBe(Number(before));
   });
+});
 
-  it("'created' match times out and is marked as 'failed'", async () => {
-    const a1 = await register('TO_Created_A1');
-    const { match_id } = await createMatch(a1.api_key);
+describe('Privacy', () => {
+  it('redacts opponent name in active match for anonymous or other agent', async () => {
+    const a1 = await register('Priv_A1');
+    const a2 = await register('Priv_A2');
+    await joinQueue(a1.api_key);
+    const { match_id } = await joinQueue(a2.api_key);
 
-    // Backdate created_at to simulate 5-minute-old match
-    await env.DB.prepare(
-      "UPDATE matches SET created_at = datetime('now', '-301 seconds') WHERE id = ?"
-    ).bind(match_id).run();
+    // Anonymous view
+    const mAnon = await getMatch(match_id);
+    expect(mAnon.agent1_name).toBe('Opponent');
+    expect(mAnon.agent2_name).toBe('Opponent');
 
-    // GET /matches triggers resolveTimedOutRounds (it calls it with null if no matchId)
-    // Actually, I need to check how it's called. In index.js GET /matches does NOT call resolveTimedOutRounds.
-    // But GET /matches/{id} DOES.
-    await getMatch(match_id);
+    // Agent 1 view (agent 1 is ID 1, which is agent2_id in this match)
+    const m1 = await getMatch(match_id, a1.api_key);
+    expect(m1.agent2_name).toBe('Priv_A1');
+    expect(m1.agent1_name).toBe('Opponent');
 
-    const match = await getMatch(match_id);
-    expect(match.status).toBe('failed');
-  });
+    // Complete match
+    await env.DB.prepare("UPDATE matches SET termination_prob = 1 WHERE id = ?").bind(match_id).run();
+    await submitAction(match_id, a1.api_key, 'cooperate');
+    await submitAction(match_id, a2.api_key, 'cooperate');
 
-  it("'created' match of inactive agent is marked as 'failed'", async () => {
-    const a1 = await register('TO_Inactive_A1');
-    const { match_id } = await createMatch(a1.api_key);
-
-    // Backdate last_seen_at to simulate 11-minute-old activity
-    await env.DB.prepare(
-      "UPDATE agents SET last_seen_at = datetime('now', '-601 seconds') WHERE id = ?"
-    ).bind(a1.id).run();
-
-    // GET /matches triggers resolveTimedOutRounds
-    await getMatch(match_id);
-
-    const match = await getMatch(match_id);
-    expect(match.status).toBe('failed');
-    
-    const agent = await env.DB.prepare("SELECT is_active FROM agents WHERE id = ?").bind(a1.id).first();
-    expect(agent.is_active).toBe(0);
+    // Reveal after completion
+    const mDone = await getMatch(match_id);
+    expect(mDone.agent1_name).toBe('Priv_A2');
+    expect(mDone.agent2_name).toBe('Priv_A1');
   });
 });
 
@@ -419,8 +437,8 @@ describe('Ongoing matches', () => {
   it('returns active matches with live scores', async () => {
     const a1 = await register('OM_A1');
     const a2 = await register('OM_A2');
-    const { match_id } = await createMatch(a1.api_key);
-    await joinMatch(match_id, a2.api_key);
+    await joinQueue(a1.api_key);
+    const { match_id } = await joinQueue(a2.api_key);
 
     // Round 1: a1 defects, a2 cooperates (5, 0)
     await submitAction(match_id, a1.api_key, 'defect');
@@ -435,21 +453,21 @@ describe('Ongoing matches', () => {
     expect(matches).toHaveLength(1);
     const m = matches[0];
     expect(m.id).toBe(match_id);
-    expect(m.agent1_name).toBe('OM_A1');
-    expect(m.agent2_name).toBe('OM_A2');
+    expect(m.agent1_name).toBe('OM_A2');
+    expect(m.agent2_name).toBe('OM_A1');
     expect(m.current_round).toBe(2); // Round 1 finished, round 2 started
-    expect(m.agent1_score).toBe(5);
-    expect(m.agent2_score).toBe(0);
+    expect(m.agent1_score).toBe(0);
+    expect(m.agent2_score).toBe(5);
   });
 
   it('excludes completed matches', async () => {
     const a1 = await register('OM_Done1');
     const a2 = await register('OM_Done2');
-    const { match_id } = await createMatch(a1.api_key);
-    await joinMatch(match_id, a2.api_key);
+    await joinQueue(a1.api_key);
+    const { match_id } = await joinQueue(a2.api_key);
 
-    // Complete the match quickly by setting round to 100
-    await env.DB.prepare("UPDATE match_rounds SET round_number = 100 WHERE match_id = ?").bind(match_id).run();
+    // Complete the match quickly by setting round to 10 and termination_prob to 1.0
+    await env.DB.prepare("UPDATE matches SET termination_prob = 1 WHERE id = ?").bind(match_id).run();
     await submitAction(match_id, a1.api_key, 'cooperate');
     await submitAction(match_id, a2.api_key, 'cooperate');
 
@@ -465,20 +483,24 @@ describe('Leaderboard', () => {
   it('returns top agents by cumulative score', async () => {
     const a1 = await register('LB_A1');
     const a2 = await register('LB_A2');
-    const { match_id } = await createMatch(a1.api_key);
-    await joinMatch(match_id, a2.api_key);
+    await joinQueue(a1.api_key);
+    const { match_id } = await joinQueue(a2.api_key);
 
+    await env.DB.prepare("UPDATE matches SET termination_prob = 0 WHERE id = ?").bind(match_id).run();
     // a1 defects every round, a2 cooperates → a1 gets 5 per round
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 9; i++) {
       await submitAction(match_id, a1.api_key, 'defect');
       await submitAction(match_id, a2.api_key, 'cooperate');
     }
+    await env.DB.prepare("UPDATE matches SET termination_prob = 1 WHERE id = ?").bind(match_id).run();
+    await submitAction(match_id, a1.api_key, 'defect');
+    await submitAction(match_id, a2.api_key, 'cooperate');
 
     const res = await SELF.fetch('http://example.com/leaderboard');
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.leaderboard).toHaveLength(2);
-    expect(body.leaderboard[0].total_score).toBe(500); // a1: 5 * 100
-    expect(body.leaderboard[1].total_score).toBe(0);   // a2: 0 * 100
+    expect(body.leaderboard[0].total_score).toBe(50); // a1: 5 * 10
+    expect(body.leaderboard[1].total_score).toBe(0);   // a2: 0 * 10
   });
 });
