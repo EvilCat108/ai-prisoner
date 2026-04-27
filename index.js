@@ -53,7 +53,8 @@ async function resolveTimedOutMatch(db, matchId, agent1Id, agent2Id, roundId, ro
 // Find active rounds whose round_started_at is >= 3 s ago and resolve each.
 // Pass specificMatchId to limit the scan to one match (used on every request).
 async function resolveTimedOutRounds(db, specificMatchId = null) {
-  const base = `
+  // 1. Resolve active matches with timed-out rounds (3s)
+  const baseActive = `
     SELECT m.id AS match_id, m.agent1_id, m.agent2_id, mr.id AS round_id, mr.round_number
     FROM matches m
     JOIN match_rounds mr ON mr.match_id = m.id
@@ -61,12 +62,154 @@ async function resolveTimedOutRounds(db, specificMatchId = null) {
       AND mr.round_number = (SELECT MAX(round_number) FROM match_rounds WHERE match_id = m.id)
       AND mr.round_started_at IS NOT NULL
       AND (julianday('now') - julianday(mr.round_started_at)) * 86400 >= 3`;
-  const { results } = specificMatchId != null
-    ? await db.prepare(base + ' AND m.id = ?').bind(specificMatchId).all()
-    : await db.prepare(base).all();
-  for (const row of (results || [])) {
+  
+  const { results: activeResults } = specificMatchId != null
+    ? await db.prepare(baseActive + ' AND m.id = ?').bind(specificMatchId).all()
+    : await db.prepare(baseActive).all();
+  
+  for (const row of (activeResults || [])) {
+    await logToDb(db, 'WARN', `Resolving timed-out round #${row.round_number} for match #${row.match_id}.`);
     await resolveTimedOutMatch(db, row.match_id, row.agent1_id, row.agent2_id, row.round_id, row.round_number);
   }
+
+  // 1b. Fail 'active' matches that are stagnant (no moves for 300s)
+  const stagnantActive = await db.prepare(`
+    SELECT m.id FROM matches m
+    JOIN match_rounds mr ON mr.match_id = m.id
+    WHERE m.status = 'active'
+      AND mr.round_number = (SELECT MAX(round_number) FROM match_rounds WHERE match_id = m.id)
+      AND (julianday('now') - julianday(mr.round_started_at)) * 86400 >= 300
+  `).all();
+  for (const m of (stagnantActive.results || [])) {
+    await logToDb(db, 'ERROR', `Match #${m.id} failed due to stagnation (300s).`);
+    await db.prepare("UPDATE matches SET status = 'failed' WHERE id = ?").bind(m.id).run();
+  }
+
+  // 1c. Global Stagnation Safety Net: Fail any 'active' match that has existed for a while 
+  // but hasn't had a round update in 10 minutes.
+  const globalStagnant = await db.prepare(`
+    SELECT m.id FROM matches m
+    JOIN match_rounds mr ON mr.match_id = m.id
+    WHERE m.status = 'active'
+      AND mr.round_number = (SELECT MAX(round_number) FROM match_rounds WHERE match_id = m.id)
+      AND (julianday('now') - julianday(COALESCE(mr.round_started_at, m.created_at))) * 86400 >= 600
+  `).all();
+  for (const m of (globalStagnant.results || [])) {
+    await logToDb(db, 'ERROR', `Match #${m.id} failed due to global stagnation (600s).`);
+    await db.prepare("UPDATE matches SET status = 'failed' WHERE id = ?").bind(m.id).run();
+  }
+
+  // 2. Fail 'created' matches that timed out (300s)
+  const baseCreated = `SELECT id FROM matches WHERE status = 'created' AND (julianday('now') - julianday(created_at)) * 86400 >= 300`;
+  const stagnantCreated = specificMatchId != null
+    ? await db.prepare(baseCreated + ' AND id = ?').bind(specificMatchId).all()
+    : await db.prepare(baseCreated).all();
+  
+  for (const m of (stagnantCreated.results || [])) {
+    await logToDb(db, 'WARN', `Match #${m.id} failed: No opponent joined within 300s.`);
+    await db.prepare("UPDATE matches SET status = 'failed' WHERE id = ?").bind(m.id).run();
+  }
+
+  // 3. Mark agents as inactive if not seen for 600s
+  const { results: becomingInactive } = await db.prepare(`
+    SELECT id, name FROM agents WHERE is_active = 1 AND (julianday('now') - julianday(last_seen_at)) * 86400 >= 600
+  `).all();
+  for (const a of (becomingInactive || [])) {
+    await logToDb(db, 'INFO', `Agent ${a.name} (id: ${a.id}) is now INACTIVE.`);
+    await db.prepare("UPDATE agents SET is_active = 0 WHERE id = ?").bind(a.id).run();
+  }
+
+  // 4. Fail 'created' matches belonging to inactive agents
+  const inactiveAgentMatches = await db.prepare(`
+    SELECT id FROM matches WHERE status = 'created' AND agent1_id IN (SELECT id FROM agents WHERE is_active = 0)
+  `).all();
+  for (const m of (inactiveAgentMatches.results || [])) {
+    await logToDb(db, 'WARN', `Match #${m.id} failed: Owner became inactive.`);
+    await db.prepare("UPDATE matches SET status = 'failed' WHERE id = ?").bind(m.id).run();
+  }
+
+  // 5. Cleanup logs: keep only the last 1000 logs
+  await db.prepare(`
+    DELETE FROM logs 
+    WHERE id NOT IN (
+      SELECT id FROM logs ORDER BY timestamp DESC LIMIT 1000
+    )
+  `).run();
+}
+
+// Fetch all active matches with their current round and live scores.
+async function getOngoingMatches(db) {
+  const { results } = await db.prepare(`
+    SELECT 
+      m.id, 
+      m.agent1_id, a1.name as agent1_name,
+      m.agent2_id, a2.name as agent2_name,
+      (SELECT MAX(round_number) FROM match_rounds WHERE match_id = m.id) as current_round,
+      COALESCE((SELECT SUM(score_change) FROM ledger_entries WHERE match_id = m.id AND agent_id = m.agent1_id), 0) as agent1_score,
+      COALESCE((SELECT SUM(score_change) FROM ledger_entries WHERE match_id = m.id AND agent_id = m.agent2_id), 0) as agent2_score
+    FROM matches m
+    JOIN agents a1 ON m.agent1_id = a1.id
+    JOIN agents a2 ON m.agent2_id = a2.id
+    JOIN match_rounds mr ON mr.match_id = m.id
+    WHERE m.status = 'active'
+      AND mr.round_number = (SELECT MAX(round_number) FROM match_rounds WHERE match_id = m.id)
+      AND (julianday('now') - julianday(mr.round_started_at)) * 86400 < 300
+    ORDER BY m.id DESC
+  `).all();
+  return results || [];
+}
+
+async function getMatchReplay(db, matchId) {
+  const match = await db.prepare(`
+    SELECT m.id, m.status, m.created_at, m.agent1_id, m.agent2_id,
+           a1.name as agent1_name, a2.name as agent2_name,
+           COALESCE((SELECT MAX(round_number) FROM match_rounds WHERE match_id = m.id), 0) as current_round
+    FROM matches m
+    LEFT JOIN agents a1 ON m.agent1_id = a1.id
+    LEFT JOIN agents a2 ON m.agent2_id = a2.id
+    WHERE m.id = ?
+  `).bind(matchId).first();
+  
+  if (!match) return null;
+
+  const { results: rows } = await db.prepare(`
+    SELECT r.round_number, a.agent_id, a.action, a.is_auto, a.submitted_at, l.score_change
+    FROM match_rounds r
+    LEFT JOIN actions a ON r.id = a.round_id
+    LEFT JOIN ledger_entries l
+      ON l.match_id = r.match_id AND l.agent_id = a.agent_id
+      AND l.reason = 'Round ' || r.round_number
+    WHERE r.match_id = ?
+    ORDER BY r.round_number ASC, a.agent_id ASC
+  `).bind(matchId).all();
+
+  const roundsMap = {};
+  for (const row of (rows || [])) {
+    if (!roundsMap[row.round_number]) {
+      roundsMap[row.round_number] = { round_number: row.round_number, actions: [], payoffs: [] };
+    }
+    if (row.agent_id != null && row.action) {
+      roundsMap[row.round_number].actions.push({
+        agent_id: row.agent_id, action: row.action, auto: !!row.is_auto, submitted_at: row.submitted_at
+      });
+    }
+    if (row.agent_id != null && row.score_change != null) {
+      roundsMap[row.round_number].payoffs.push({
+        agent_id: row.agent_id, score_change: row.score_change
+      });
+    }
+  }
+
+  const { results: scores } = await db.prepare(
+    'SELECT agent_id, SUM(score_change) as total_score FROM ledger_entries WHERE match_id = ? GROUP BY agent_id'
+  ).bind(matchId).all();
+
+  return {
+    ...match,
+    rounds_total: NUM_ROUNDS,
+    rounds: Object.values(roundsMap),
+    final_scores: scores || []
+  };
 }
 
 function generateApiKey() {
@@ -79,18 +222,37 @@ async function authenticate(request, db) {
   const auth = request.headers.get('Authorization') || '';
   const m = auth.match(/^Bearer (.+)$/);
   if (!m) return null;
-  return await db.prepare('SELECT id, name, api_key, is_active FROM agents WHERE api_key = ?').bind(m[1]).first();
+  const agent = await db.prepare('SELECT id, name, api_key, is_active FROM agents WHERE api_key = ?').bind(m[1]).first();
+  if (agent) {
+    // Background update of activity
+    await db.prepare("UPDATE agents SET last_seen_at = CURRENT_TIMESTAMP, is_active = 1 WHERE id = ?").bind(agent.id).run();
+  }
+  return agent;
+}
+
+async function logToDb(db, level, message) {
+  try {
+    await db.prepare('INSERT INTO logs (level, message) VALUES (?, ?)').bind(level, message).run();
+  } catch (e) {
+    console.error('Failed to write log to DB:', e);
+  }
 }
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json' }
+    headers: { 
+      'Content-Type': 'application/json',
+      'Vary': 'Accept'
+    }
   });
 }
 
 function err(msg, status) {
-  return new Response(msg, { status });
+  return new Response(msg, { 
+    status,
+    headers: { 'Vary': 'Accept' }
+  });
 }
 
 function html(body, title = 'AI Prisoner Dilemma Arena') {
@@ -100,37 +262,90 @@ function html(body, title = 'AI Prisoner Dilemma Arena') {
   <meta charset="utf-8">
   <title>${title}</title>
   <style>
-    body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5;line-height:1.6}
-    h1{color:#333;border-bottom:2px solid #007bff;padding-bottom:8px}
-    h2{color:#444;margin-top:30px}
-    h3{color:#555;margin-top:20px}
-    a{color:#007bff;text-decoration:none}
+    :root {
+      --bg: #f5f5f5;
+      --wrap-bg: #ffffff;
+      --text: #333333;
+      --text-muted: #666666;
+      --heading: #333333;
+      --heading-sub: #444444;
+      --primary: #007bff;
+      --border: #dddddd;
+      --table-th: #f2f2f2;
+      --code-bg: #f4f4f4;
+      --info-bg: #e8f4f8;
+      --info-border: #17a2b8;
+      --warn-bg: #fff3cd;
+      --warn-border: #ffc107;
+      --step-bg: #fafafa;
+      --step-border: #dee2e6;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #121212;
+        --wrap-bg: #1e1e1e;
+        --text: #e0e0e0;
+        --text-muted: #aaaaaa;
+        --heading: #ffffff;
+        --heading-sub: #cccccc;
+        --primary: #3794ff;
+        --border: #333333;
+        --table-th: #2d2d2d;
+        --code-bg: #2d2d2d;
+        --info-bg: #102a35;
+        --info-border: #17a2b8;
+        --warn-bg: #332b00;
+        --warn-border: #ffc107;
+        --step-bg: #252525;
+        --step-border: #444444;
+      }
+    }
+
+    body{font-family:Arial,sans-serif;margin:20px;background:var(--bg);color:var(--text);line-height:1.6}
+    h1{color:var(--heading);border-bottom:2px solid var(--primary);padding-bottom:8px}
+    h2{color:var(--heading-sub);margin-top:30px}
+    h3{color:var(--text);margin-top:20px}
+    a{color:var(--primary);text-decoration:none}
     a:hover{text-decoration:underline}
-    .wrap{max-width:900px;margin:0 auto;background:#fff;padding:24px;border-radius:6px}
+    .wrap{max-width:900px;margin:0 auto;background:var(--wrap-bg);padding:24px;border-radius:6px;box-shadow: 0 2px 4px rgba(0,0,0,0.1)}
     table{border-collapse:collapse;width:100%;margin:12px 0}
-    th,td{border:1px solid #ddd;padding:8px;text-align:left}
-    th{background:#f2f2f2}
-    pre,code,.cb{background:#f4f4f4;border-left:4px solid #007bff;padding:12px;margin:10px 0;font-family:monospace;white-space:pre;overflow-x:auto;font-size:13px;display:block}
-    .info{background:#e8f4f8;border-left:4px solid #17a2b8;padding:10px;margin:10px 0}
-    .warn{background:#fff3cd;border-left:4px solid #ffc107;padding:10px;margin:10px 0}
-    .step{margin:20px 0;padding:15px;border:1px solid #dee2e6;border-radius:4px;background:#fafafa}
-    .step h3{margin:0 0 10px;color:#007bff}
+    th,td{border:1px solid var(--border);padding:8px;text-align:left}
+    th{background:var(--table-th)}
+    pre,code,.cb{background:var(--code-bg);border-left:4px solid var(--primary);padding:12px;margin:10px 0;font-family:monospace;white-space:pre;overflow-x:auto;font-size:13px;display:block;color:var(--text)}
+    .info{background:var(--info-bg);border-left:4px solid var(--info-border);padding:10px;margin:10px 0}
+    .warn{background:var(--warn-bg);border-left:4px solid var(--warn-border);padding:10px;margin:10px 0}
+    .step{margin:20px 0;padding:15px;border:1px solid var(--step-border);border-radius:4px;background:var(--step-bg)}
+    .step h3{margin:0 0 10px;color:var(--primary)}
     nav{margin-bottom:20px}
   </style>
 </head>
 <body><div class="wrap">${body}</div></body>
-</html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+</html>`, { 
+    headers: { 
+      'Content-Type': 'text/html; charset=utf-8',
+      'Vary': 'Accept'
+    } 
+  });
 }
 
 export { ClaudeAgent } from './claude_agent.js';
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
     const db = env.DB;
-    const wantsHtml = (request.headers.get('Accept') || '').includes('text/html');
+
+    // Use query param or Accept header to determine format.
+    // format=json query param is preferred as it avoids cache collisions with the HTML page.
+    const accept = request.headers.get('Accept') || '';
+    const wantsJson = url.searchParams.get('format') === 'json' || 
+                      accept.includes('application/json') || 
+                      accept === '*/*' || 
+                      accept === '';
+    const wantsHtml = !wantsJson && accept.includes('text/html');
 
     try {
 
@@ -142,6 +357,7 @@ export default {
           <p>A tournament where autonomous agents play the iterated Prisoner's Dilemma.</p>
           <ul>
             <li><a href="/register-instructions">Agent Participation Guide</a></li>
+            <li><a href="/ongoing"><strong>Live Ongoing Matches (Spectate)</strong></a></li>
             <li><a href="/agents">Registered Agents</a></li>
             <li><a href="/matches">All Matches</a></li>
             <li><a href="/matches?status=created">Open Matches (waiting for opponent)</a></li>
@@ -173,6 +389,7 @@ export default {
           const agent = await db.prepare(
             'SELECT id, name, api_key, is_active, created_at FROM agents WHERE id = ?'
           ).bind(result.meta.last_row_id).first();
+          await logToDb(db, 'INFO', `New agent registered: ${name} (id: ${agent.id})`);
           return json({ agent });
         } catch (e) {
           if (e.message && e.message.includes('UNIQUE')) return err('Agent name already taken', 409);
@@ -182,18 +399,19 @@ export default {
 
       // ── GET /agents ─────────────────────────────────────────────────────────
       if (path === '/agents' && method === 'GET') {
+        await resolveTimedOutRounds(db);
         const { results } = await db.prepare(
-          'SELECT id, name, is_active, created_at FROM agents ORDER BY id'
+          'SELECT id, name, is_active, created_at FROM agents ORDER BY name ASC'
         ).all();
-        if (!wantsHtml) return json(results || []);
+        if (wantsJson) return json(results || []);
         const rows = (results || []).map(a =>
-          `<tr><td>${a.id}</td><td>${a.name}</td><td>${a.is_active ? 'Yes' : 'No'}</td><td>${a.created_at}</td></tr>`
-        ).join('') || '<tr><td colspan="4"><em>No agents registered yet.</em></td></tr>';
+          `<tr><td>${a.name}</td><td>${a.is_active ? 'Yes' : 'No'}</td><td>${a.created_at}</td></tr>`
+        ).join('') || '<tr><td colspan="3"><em>No agents registered yet.</em></td></tr>';
         return html(`
           <nav><a href="/">← Home</a></nav>
           <h1>Registered Agents</h1>
           <table>
-            <tr><th>ID</th><th>Name</th><th>Active</th><th>Registered</th></tr>
+            <tr><th>Name</th><th>Active</th><th>Registered</th></tr>
             ${rows}
           </table>
         `, 'Agents');
@@ -201,21 +419,53 @@ export default {
 
       // ── GET /matches ────────────────────────────────────────────────────────
       if (path === '/matches' && method === 'GET') {
+        await resolveTimedOutRounds(db);
         const statusFilter = url.searchParams.get('status');
+        
+        const baseQuery = `
+          SELECT 
+            m.id, m.status, m.created_at,
+            a1.name as agent1_name,
+            a2.name as agent2_name,
+            COALESCE((SELECT SUM(score_change) FROM ledger_entries WHERE match_id = m.id AND agent_id = m.agent1_id), 0) as score1,
+            COALESCE((SELECT SUM(score_change) FROM ledger_entries WHERE match_id = m.id AND agent_id = m.agent2_id), 0) as score2
+          FROM matches m
+          LEFT JOIN agents a1 ON m.agent1_id = a1.id
+          LEFT JOIN agents a2 ON m.agent2_id = a2.id
+        `;
+        
         const stmt = statusFilter
-          ? db.prepare('SELECT id, agent1_id, agent2_id, status, created_at FROM matches WHERE status = ? ORDER BY id DESC').bind(statusFilter)
-          : db.prepare('SELECT id, agent1_id, agent2_id, status, created_at FROM matches ORDER BY id DESC');
+          ? db.prepare(baseQuery + ' WHERE m.status = ? ORDER BY m.id DESC').bind(statusFilter)
+          : db.prepare(baseQuery + ' ORDER BY m.id DESC');
+          
         const { results } = await stmt.all();
-        if (!wantsHtml) return json(results || []);
+        if (wantsJson) return json(results || []);
+        
+        const rows = (results || []).map(m => {
+          const s1 = m.score1;
+          const s2 = m.score2;
+          let scoreHtml = '-';
+          if (m.status === 'completed' || m.status === 'active') {
+            const w1 = s1 > s2 ? 'font-weight:bold; color:var(--primary);' : '';
+            const w2 = s2 > s1 ? 'font-weight:bold; color:var(--primary);' : '';
+            scoreHtml = `<span style="${w1}">${s1}</span> - <span style="${w2}">${s2}</span>`;
+          }
+          
+          return `<tr>
+            <td>${m.created_at}</td>
+            <td>${m.agent1_name ?? 'Unknown'}</td>
+            <td>${m.agent2_name ?? (m.status === 'created' ? '<em>waiting...</em>' : 'Unknown')}</td>
+            <td>${m.status}</td>
+            <td>${scoreHtml}</td>
+          </tr>`;
+        }).join('') || '<tr><td colspan="5"><em>No matches yet.</em></td></tr>';
+
         const heading = statusFilter ? `Matches — status: ${statusFilter}` : 'All Matches';
-        const rows = (results || []).map(m =>
-          `<tr><td><a href="/matches/${m.id}">${m.id}</a></td><td>${m.agent1_id ?? '-'}</td><td>${m.agent2_id ?? '-'}</td><td>${m.status}</td><td>${m.created_at}</td></tr>`
-        ).join('') || '<tr><td colspan="5"><em>No matches yet.</em></td></tr>';
         return html(`
           <nav><a href="/">← Home</a></nav>
           <h1>${heading}</h1>
           <table>
-            <tr><th>ID</th><th>Agent 1</th><th>Agent 2</th><th>Status</th><th>Created</th></tr>
+            <tr><th>Created</th><th>Agent 1</th><th>Agent 2</th><th>Status</th><th>Score</th></tr>
             ${rows}
           </table>
         `, 'Matches');
@@ -228,54 +478,24 @@ export default {
         const result = await db.prepare(
           "INSERT INTO matches (agent1_id, status) VALUES (?, 'created')"
         ).bind(agent.id).run();
-        return json({ match_id: result.meta.last_row_id });
+        const matchId = result.meta.last_row_id;
+        await logToDb(db, 'INFO', `Match created: #${matchId} by agent ${agent.name} (id: ${agent.id})`);
+
+        // Wake up the Claude agent to see if it wants to join
+        const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
+        const doObj = env.CLAUDE_AGENT.get(doId);
+        ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
+
+        return json({ match_id: matchId });
       }
 
       // ── /matches/{id}/replay ────────────────────────────────────────────────
       const replayM = path.match(/^\/matches\/(\d+)\/replay$/);
       if (replayM && method === 'GET') {
         const matchId = parseInt(replayM[1]);
-        const match = await db.prepare('SELECT id, status FROM matches WHERE id = ?').bind(matchId).first();
-        if (!match) return err('Match not found', 404);
-
-        const { results: rows } = await db.prepare(`
-          SELECT r.round_number, a.agent_id, a.action, a.is_auto, a.submitted_at, l.score_change
-          FROM match_rounds r
-          LEFT JOIN actions a ON r.id = a.round_id
-          LEFT JOIN ledger_entries l
-            ON l.match_id = r.match_id AND l.agent_id = a.agent_id
-            AND l.reason = 'Round ' || r.round_number
-          WHERE r.match_id = ?
-          ORDER BY r.round_number, a.agent_id
-        `).bind(matchId).all();
-
-        const roundsMap = {};
-        for (const row of (rows || [])) {
-          if (!roundsMap[row.round_number]) {
-            roundsMap[row.round_number] = { round_number: row.round_number, actions: [], payoffs: [] };
-          }
-          if (row.agent_id != null && row.action) {
-            roundsMap[row.round_number].actions.push({
-              agent_id: row.agent_id, action: row.action, auto: !!row.is_auto, submitted_at: row.submitted_at
-            });
-          }
-          if (row.agent_id != null && row.score_change != null) {
-            roundsMap[row.round_number].payoffs.push({
-              agent_id: row.agent_id, score_change: row.score_change
-            });
-          }
-        }
-
-        const { results: scores } = await db.prepare(
-          'SELECT agent_id, SUM(score_change) as total_score FROM ledger_entries WHERE match_id = ? GROUP BY agent_id'
-        ).bind(matchId).all();
-
-        return json({
-          match_id: matchId,
-          status: match.status,
-          rounds: Object.values(roundsMap),
-          final_scores: scores || []
-        });
+        const data = await getMatchReplay(db, matchId);
+        if (!data) return err('Match not found', 404);
+        return json(data);
       }
 
       // ── POST /matches/{id}/join ─────────────────────────────────────────────
@@ -295,6 +515,14 @@ export default {
           db.prepare("UPDATE matches SET agent2_id = ?, status = 'active' WHERE id = ?").bind(agent.id, matchId),
           db.prepare('INSERT INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, 1, CURRENT_TIMESTAMP)').bind(matchId),
         ]);
+        
+        await logToDb(db, 'INFO', `Agent ${agent.name} (id: ${agent.id}) joined match #${matchId}. Match is now ACTIVE.`);
+
+        // Wake up the Claude agent in case it is waiting for this match
+        const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
+        const doObj = env.CLAUDE_AGENT.get(doId);
+        ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
+
         return new Response(null, { status: 200 });
       }
 
@@ -361,6 +589,11 @@ export default {
           }
           await db.batch(ops);
         }
+        
+        // Wake up the Claude agent so it plays its turn without waiting 30s
+        const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
+        const doObj = env.CLAUDE_AGENT.get(doId);
+        ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
 
         return new Response(null, { status: 200 });
       }
@@ -369,25 +602,88 @@ export default {
       const matchIdM = path.match(/^\/matches\/(\d+)$/);
       if (matchIdM && method === 'GET') {
         const matchId = parseInt(matchIdM[1]);
-        // Resolve timed-out rounds so polling agents see accurate state without needing
-        // a separate cron invocation.
         await resolveTimedOutRounds(db, matchId);
-        const match = await db.prepare(
-          'SELECT id, agent1_id, agent2_id, status, created_at FROM matches WHERE id = ?'
-        ).bind(matchId).first();
-        if (!match) return err('Match not found', 404);
-        const roundRow = await db.prepare(
-          'SELECT COALESCE(MAX(round_number), 0) as cur FROM match_rounds WHERE match_id = ?'
-        ).bind(matchId).first();
-        return json({
-          id: match.id,
-          agent1_id: match.agent1_id,
-          agent2_id: match.agent2_id,
-          status: match.status,
-          current_round: roundRow?.cur ?? 0,
-          rounds_total: NUM_ROUNDS,
-          created_at: match.created_at
-        });
+        
+        const data = await getMatchReplay(db, matchId);
+        if (!data) return err('Match not found', 404);
+        
+        if (wantsJson) return json(data);
+
+        return html(`
+          <nav><a href="/matches">← Back to Matches</a></nav>
+          <h1>Match #${data.id}</h1>
+          <div class="info">
+            <strong>Status:</strong> ${data.status} &nbsp;|&nbsp; 
+            <strong>Created:</strong> ${data.created_at}
+          </div>
+
+          <div style="display:flex; justify-content:space-between; align-items:center; margin: 20px 0; padding: 20px; background: var(--step-bg); border-radius: 8px; border: 1px solid var(--step-border);">
+            <div style="flex:1; text-align:center;">
+              <div style="font-size:1.2em; font-weight:bold;">${data.agent1_name ?? 'Agent 1'}</div>
+              <div id="score1" style="font-size:2.5em; color:var(--primary);">${data.final_scores.find(s => s.agent_id === data.agent1_id)?.total_score ?? 0}</div>
+            </div>
+            <div style="padding:0 30px; font-size:1.5em; font-weight:bold; color:var(--text-muted);">VS</div>
+            <div style="flex:1; text-align:center;">
+              <div style="font-size:1.2em; font-weight:bold;">${data.agent2_name ?? 'Agent 2'}</div>
+              <div id="score2" style="font-size:2.5em; color:var(--primary);">${data.final_scores.find(s => s.agent_id === data.agent2_id)?.total_score ?? 0}</div>
+            </div>
+          </div>
+
+          <h2>Round History</h2>
+          <table id="rounds-table">
+            <tr><th>Round</th><th>${data.agent1_name ?? 'Agent 1'}</th><th>${data.agent2_name ?? 'Agent 2'}</th><th>Payoffs</th></tr>
+            <tbody id="rounds-body">
+              ${data.rounds.map(r => {
+                const a1 = r.actions.find(a => a.agent_id === data.agent1_id);
+                const a2 = r.actions.find(a => a.agent_id === data.agent2_id);
+                const p1 = r.payoffs.find(p => p.agent_id === data.agent1_id);
+                const p2 = r.payoffs.find(p => p.agent_id === data.agent2_id);
+                return `<tr>
+                  <td>${r.round_number}</td>
+                  <td>${a1 ? a1.action + (a1.auto ? ' (auto)' : '') : '...'}</td>
+                  <td>${a2 ? a2.action + (a2.auto ? ' (auto)' : '') : '...'}</td>
+                  <td>${p1 && p2 ? `+${p1.score_change} / +${p2.score_change}` : '-'}</td>
+                </tr>`;
+              }).reverse().join('')}
+            </tbody>
+          </table>
+
+          <script>
+            async function refresh() {
+              if ("${data.status}" === "completed" || "${data.status}" === "failed") return;
+              try {
+                const res = await fetch(window.location.pathname + '?format=json');
+                const data = await res.json();
+                
+                // Update scores
+                const s1 = data.final_scores.find(s => s.agent_id === data.agent1_id)?.total_score ?? 0;
+                const s2 = data.final_scores.find(s => s.agent_id === data.agent2_id)?.total_score ?? 0;
+                document.getElementById('score1').innerText = s1;
+                document.getElementById('score2').innerText = s2;
+                
+                // Update table
+                const body = document.getElementById('rounds-body');
+                body.innerHTML = data.rounds.map(r => {
+                  const a1 = r.actions.find(a => a.agent_id === data.agent1_id);
+                  const a2 = r.actions.find(a => a.agent_id === data.agent2_id);
+                  const p1 = r.payoffs.find(p => p.agent_id === data.agent1_id);
+                  const p2 = r.payoffs.find(p => p.agent_id === data.agent2_id);
+                  return \`<tr>
+                    <td>\${r.round_number}</td>
+                    <td>\${a1 ? a1.action + (a1.auto ? ' (auto)' : '') : '...'}</td>
+                    <td>\${a2 ? a2.action + (a2.auto ? ' (auto)' : '') : '...'}</td>
+                    <td>\${p1 && p2 ? '+' + p1.score_change + ' / +' + p2.score_change : '-'}</td>
+                  </tr>\`;
+                }).reverse().join('');
+                
+                if (data.status === 'completed' || data.status === 'failed') {
+                  window.location.reload(); // Stop polling and show final state
+                }
+              } catch (e) { console.error(e); }
+            }
+            setInterval(refresh, 3000);
+          </script>
+        `, `Match #${data.id}`);
       }
 
       // ── GET /leaderboard ────────────────────────────────────────────────────
@@ -402,7 +698,9 @@ export default {
           ORDER BY total_score DESC
           LIMIT 10
         `).all();
-        if (!wantsHtml) return json({ leaderboard: results || [] });
+        
+        if (wantsJson) return json({ leaderboard: results || [] });
+        
         const rows = (results || []).map((a, i) =>
           `<tr><td>${i + 1}</td><td>${a.name}</td><td>${a.total_score}</td><td>${a.matches_played}</td></tr>`
         ).join('') || '<tr><td colspan="4"><em>No matches played yet.</em></td></tr>';
@@ -591,6 +889,67 @@ for s in replay["final_scores"]:
         const id  = env.CLAUDE_AGENT.idFromName('claude-singleton');
         const obj = env.CLAUDE_AGENT.get(id);
         return obj.fetch(new Request('http://do/status', { method: 'GET' }));
+      }
+
+      // ── GET /ongoing ────────────────────────────────────────────────────────
+      if (path === '/ongoing' && method === 'GET') {
+        if (wantsJson) {
+          await resolveTimedOutRounds(db);
+          const matches = await getOngoingMatches(db);
+          const response = json(matches);
+          // 3-second cache is fine for live updates
+          response.headers.set('Cache-Control', 'public, max-age=3');
+          return response;
+        }
+
+        return html(`
+          <nav><a href="/">← Home</a></nav>
+          <h1>Live Ongoing Matches</h1>
+          <p>This page updates automatically every 3 seconds. <span id="last-updated" style="font-size:0.8em; color:var(--text-muted); margin-left:10px;"></span></p>
+          <div id="ongoing-list"><em>Loading live matches...</em></div>
+
+          <script>
+            async function update() {
+              try {
+                const res = await fetch('/ongoing?format=json');
+                if (!res.ok) throw new Error('Fetch failed: ' + res.status);
+                const matches = await res.json();
+                document.getElementById('last-updated').innerText = 'Last updated: ' + new Date().toLocaleTimeString();
+                const container = document.getElementById('ongoing-list');
+                if (matches.length === 0) {
+                  container.innerHTML = '<div class="info">No matches are currently active.</div>';
+                  return;
+                }
+                container.innerHTML = matches.map(m => \`
+                  <div class="step">
+                    <h3>Match #\${m.id}</h3>
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                      <div style="flex:1; text-align:center;">
+                        <div style="font-size:1.2em; font-weight:bold;">\${m.agent1_name}</div>
+                        <div style="font-size:2em; color:var(--primary);">\${m.agent1_score}</div>
+                      </div>
+                      <div style="padding:0 20px; font-weight:bold; color:var(--text-muted);">VS</div>
+                      <div style="flex:1; text-align:center;">
+                        <div style="font-size:1.2em; font-weight:bold;">\${m.agent2_name}</div>
+                        <div style="font-size:2em; color:var(--primary);">\${m.agent2_score}</div>
+                      </div>
+                    </div>
+                    <div style="text-align:center; margin-top:10px; color:var(--text-muted);">
+                      Current Round: <strong>\${m.current_round} / 100</strong>
+                    </div>
+                    <div style="text-align:center; margin-top:10px;">
+                      <a href="/matches/\${m.id}">View Match Details →</a>
+                    </div>
+                  </div>
+                \`).join('');
+              } catch (e) {
+                console.error('Update failed', e);
+              }
+            }
+            update();
+            setInterval(update, 3000);
+          </script>
+        `, 'Live Matches');
       }
 
       // ── 404 ─────────────────────────────────────────────────────────────────

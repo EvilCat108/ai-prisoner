@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS agents (
   name TEXT NOT NULL UNIQUE,
   api_key TEXT NOT NULL UNIQUE,
   is_active BOOLEAN NOT NULL DEFAULT 1,
+  last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS matches (
@@ -56,10 +57,17 @@ CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
   snapshot_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (agent_id) REFERENCES agents(id)
 );
+CREATE TABLE IF NOT EXISTS logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  level TEXT,
+  message TEXT,
+  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 CREATE INDEX IF NOT EXISTS idx_matches_status ON matches(status);
 CREATE INDEX IF NOT EXISTS idx_match_rounds_match_id ON match_rounds(match_id);
 CREATE INDEX IF NOT EXISTS idx_actions_round_id ON actions(round_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_agent_id ON ledger_entries(agent_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_entries_match_agent ON ledger_entries(match_id, agent_id);
 CREATE INDEX IF NOT EXISTS idx_leaderboard_snapshots_agent_id ON leaderboard_snapshots(agent_id);
 `.trim();
 
@@ -71,6 +79,7 @@ beforeAll(async () => {
 
 beforeEach(async () => {
   await env.DB.batch([
+    env.DB.prepare('DELETE FROM logs'),
     env.DB.prepare('DELETE FROM leaderboard_snapshots'),
     env.DB.prepare('DELETE FROM ledger_entries'),
     env.DB.prepare('DELETE FROM actions'),
@@ -366,6 +375,89 @@ describe('Round timeout', () => {
     ).bind(match_id).all();
 
     expect(Number(after)).toBe(Number(before));
+  });
+
+  it("'created' match times out and is marked as 'failed'", async () => {
+    const a1 = await register('TO_Created_A1');
+    const { match_id } = await createMatch(a1.api_key);
+
+    // Backdate created_at to simulate 5-minute-old match
+    await env.DB.prepare(
+      "UPDATE matches SET created_at = datetime('now', '-301 seconds') WHERE id = ?"
+    ).bind(match_id).run();
+
+    // GET /matches triggers resolveTimedOutRounds (it calls it with null if no matchId)
+    // Actually, I need to check how it's called. In index.js GET /matches does NOT call resolveTimedOutRounds.
+    // But GET /matches/{id} DOES.
+    await getMatch(match_id);
+
+    const match = await getMatch(match_id);
+    expect(match.status).toBe('failed');
+  });
+
+  it("'created' match of inactive agent is marked as 'failed'", async () => {
+    const a1 = await register('TO_Inactive_A1');
+    const { match_id } = await createMatch(a1.api_key);
+
+    // Backdate last_seen_at to simulate 11-minute-old activity
+    await env.DB.prepare(
+      "UPDATE agents SET last_seen_at = datetime('now', '-601 seconds') WHERE id = ?"
+    ).bind(a1.id).run();
+
+    // GET /matches triggers resolveTimedOutRounds
+    await getMatch(match_id);
+
+    const match = await getMatch(match_id);
+    expect(match.status).toBe('failed');
+    
+    const agent = await env.DB.prepare("SELECT is_active FROM agents WHERE id = ?").bind(a1.id).first();
+    expect(agent.is_active).toBe(0);
+  });
+});
+
+describe('Ongoing matches', () => {
+  it('returns active matches with live scores', async () => {
+    const a1 = await register('OM_A1');
+    const a2 = await register('OM_A2');
+    const { match_id } = await createMatch(a1.api_key);
+    await joinMatch(match_id, a2.api_key);
+
+    // Round 1: a1 defects, a2 cooperates (5, 0)
+    await submitAction(match_id, a1.api_key, 'defect');
+    await submitAction(match_id, a2.api_key, 'cooperate');
+
+    const res = await SELF.fetch('http://example.com/ongoing', {
+      headers: { 'Accept': 'application/json' }
+    });
+    expect(res.status).toBe(200);
+    const matches = await res.json();
+    
+    expect(matches).toHaveLength(1);
+    const m = matches[0];
+    expect(m.id).toBe(match_id);
+    expect(m.agent1_name).toBe('OM_A1');
+    expect(m.agent2_name).toBe('OM_A2');
+    expect(m.current_round).toBe(2); // Round 1 finished, round 2 started
+    expect(m.agent1_score).toBe(5);
+    expect(m.agent2_score).toBe(0);
+  });
+
+  it('excludes completed matches', async () => {
+    const a1 = await register('OM_Done1');
+    const a2 = await register('OM_Done2');
+    const { match_id } = await createMatch(a1.api_key);
+    await joinMatch(match_id, a2.api_key);
+
+    // Complete the match quickly by setting round to 100
+    await env.DB.prepare("UPDATE match_rounds SET round_number = 100 WHERE match_id = ?").bind(match_id).run();
+    await submitAction(match_id, a1.api_key, 'cooperate');
+    await submitAction(match_id, a2.api_key, 'cooperate');
+
+    const res = await SELF.fetch('http://example.com/ongoing', {
+      headers: { 'Accept': 'application/json' }
+    });
+    const matches = await res.json();
+    expect(matches.filter(m => m.id === match_id)).toHaveLength(0);
   });
 });
 

@@ -6,6 +6,7 @@ CREATE TABLE agents (
     name TEXT NOT NULL UNIQUE,
     api_key TEXT NOT NULL UNIQUE,
     is_active BOOLEAN NOT NULL DEFAULT 1,
+    last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -70,4 +71,5 @@ CREATE INDEX idx_matches_status ON matches(status);
 CREATE INDEX idx_match_rounds_match_id ON match_rounds(match_id);
 CREATE INDEX idx_actions_round_id ON actions(round_id);
 CREATE INDEX idx_ledger_entries_agent_id ON ledger_entries(agent_id);
+CREATE INDEX idx_ledger_entries_match_agent ON ledger_entries(match_id, agent_id);
 CREATE INDEX idx_leaderboard_snapshots_agent_id ON leaderboard_snapshots(agent_id);
