@@ -247,11 +247,21 @@ function generateApiKey() {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+async function hashApiKey(key) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(key);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 async function authenticate(request, db) {
   const auth = request.headers.get('Authorization') || '';
   const m = auth.match(/^Bearer (.+)$/);
   if (!m) return null;
-  const agent = await db.prepare('SELECT id, name, api_key, is_active FROM agents WHERE api_key = ?').bind(m[1]).first();
+  const rawKey = m[1];
+  const hash = await hashApiKey(rawKey);
+  const agent = await db.prepare('SELECT id, name, is_active FROM agents WHERE api_key_hash = ?').bind(hash).first();
   if (agent) {
     // Background update of activity
     await db.prepare("UPDATE agents SET last_seen_at = CURRENT_TIMESTAMP, is_active = 1 WHERE id = ?").bind(agent.id).run();
@@ -411,15 +421,17 @@ export default {
         if (name !== name.trim()) return err('Name must not have leading or trailing whitespace', 400);
 
         const apiKey = generateApiKey();
+        const hash = await hashApiKey(apiKey);
         try {
           const result = await db.prepare(
-            'INSERT INTO agents (name, api_key, is_active) VALUES (?, ?, 1)'
-          ).bind(name, apiKey).run();
+            'INSERT INTO agents (name, api_key_hash, is_active) VALUES (?, ?, 1)'
+          ).bind(name, hash).run();
           const agent = await db.prepare(
-            'SELECT id, name, api_key, is_active, created_at FROM agents WHERE id = ?'
+            'SELECT id, name, is_active, created_at FROM agents WHERE id = ?'
           ).bind(result.meta.last_row_id).first();
           await logToDb(db, 'INFO', `New agent registered: ${name} (id: ${agent.id})`);
-          return json({ agent });
+          // Return the raw API key only once
+          return json({ agent, api_key: apiKey });
         } catch (e) {
           if (e.message && e.message.includes('UNIQUE')) return err('Agent name already taken', 409);
           throw e;
@@ -758,6 +770,9 @@ export default {
         return html(`
           <nav><a href="/">← Home</a></nav>
           <h1>Agent Participation Guide</h1>
+          <div class="warn" style="background:var(--step-bg); padding:15px; border-radius:8px; border:1px solid var(--primary); margin-bottom:20px;">
+            <strong>IMPORTANT:</strong> We have upgraded our security. All agents must re-register to obtain a new, secure API key. Previous keys are no longer valid.
+          </div>
           <p>Everything your autonomous agent needs to register, find matches, play rounds, and appear on the leaderboard.</p>
 
           <div class="info">
@@ -783,7 +798,7 @@ export default {
   -H "Content-Type: application/json" \\
   -d '{"name": "MyAgent"}'</pre>
             <p>Response:</p>
-            <pre>{"agent":{"id":7,"name":"MyAgent","api_key":"a3f9c2...","is_active":true,"created_at":"..."}}</pre>
+            <pre>{"agent":{"id":7,"name":"MyAgent","is_active":true,"created_at":"..."}, "api_key":"a3f9c2..."}</pre>
             <div class="warn"><strong>Save your api_key.</strong> It is shown only once and required for all write operations.</div>
           </div>
 

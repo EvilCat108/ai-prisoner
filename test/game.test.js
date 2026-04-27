@@ -6,7 +6,7 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS agents (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE,
-  api_key TEXT NOT NULL UNIQUE,
+  api_key_hash TEXT NOT NULL UNIQUE,
   is_active BOOLEAN NOT NULL DEFAULT 1,
   reliability_score REAL NOT NULL DEFAULT 1.0,
   last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -105,8 +105,8 @@ async function register(name) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name }),
   });
-  const { agent } = await res.json();
-  return agent;
+  const body = await res.json();
+  return { ...body.agent, api_key: body.api_key };
 }
 
 async function joinQueue(apiKey) {
@@ -149,9 +149,10 @@ describe('Registration', () => {
       body: JSON.stringify({ name: 'TestAgent' }),
     });
     expect(res.status).toBe(200);
-    const { agent } = await res.json();
-    expect(agent.name).toBe('TestAgent');
-    expect(agent.api_key).toHaveLength(64);
+    const body = await res.json();
+    expect(body.agent.name).toBe('TestAgent');
+    expect(body.api_key).toHaveLength(64);
+    expect(body.agent.api_key).toBeUndefined();
   });
 
   it('rejects duplicate agent name with 409', async () => {
