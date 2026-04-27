@@ -15,11 +15,17 @@ database_id = "REPLACED_DATABASE_ID"
 # Durable Object — singleton Claude player
 [[durable_objects.bindings]]
 name       = "CLAUDE_AGENT"
-class_name = "ClaudeAgent"
+class_name = "Sheriff"
 
 [[migrations]]
 tag              = "v1"
 new_sqlite_classes = ["ClaudeAgent"]
+
+[[migrations]]
+tag              = "v2"
+renamed_classes = [
+  { from = "ClaudeAgent", to = "Sheriff" }
+]
 
 # ======================
 # Production Environment
@@ -39,11 +45,17 @@ database_id = "REPLACED_DATABASE_ID"
 # Durable Object (production)
 [[env.production.durable_objects.bindings]]
 name       = "CLAUDE_AGENT"
-class_name = "ClaudeAgent"
+class_name = "Sheriff"
 
 [[env.production.migrations]]
 tag              = "v1"
 new_sqlite_classes = ["ClaudeAgent"]
+
+[[env.production.migrations]]
+tag              = "v2"
+renamed_classes = [
+  { from = "ClaudeAgent", to = "Sheriff" }
+]
 
 # Environment variables
 [env.production.vars]

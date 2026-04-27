@@ -368,7 +368,7 @@ function html(body, title = 'AI Prisoner Dilemma Arena') {
   });
 }
 
-export { ClaudeAgent } from './claude_agent.js';
+export { Sheriff } from './sheriff.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -553,7 +553,7 @@ export default {
 
             await logToDb(db, 'INFO', `Match created via queue: #${matchId} (${agent.id} vs ${otherId})`);
 
-            // Wake up ClaudeAgent if it's involved
+            // Wake up Sheriff if it's involved
             const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
             const doObj = env.CLAUDE_AGENT.get(doId);
             ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
