@@ -36,20 +36,70 @@ async function resolveTimedOutMatch(db, matchId, agent1Id, agent2Id, roundId, ro
   
   // Fetch match details to get termination_prob
   const match = await db.prepare("SELECT termination_prob FROM matches WHERE id = ?").bind(matchId).first();
-  const shouldTerminate = Math.random() < (match?.termination_prob ?? 0.02);
-
+  
   const ops = [
     db.prepare('INSERT INTO ledger_entries (match_id, agent_id, score_change, reason) VALUES (?, ?, ?, ?)').bind(matchId, agent1Id, p1, reason),
     db.prepare('INSERT INTO ledger_entries (match_id, agent_id, score_change, reason) VALUES (?, ?, ?, ?)').bind(matchId, agent2Id, p2, reason),
   ];
-  if (shouldTerminate) {
-    ops.push(db.prepare("UPDATE matches SET status = 'completed' WHERE id = ?").bind(matchId));
+
+  // Three-Strike Forfeit Check
+  const checkThreeStrikes = async (agentId) => {
+    const recent = await db.prepare(`
+      SELECT a.is_auto 
+      FROM actions a 
+      JOIN match_rounds mr ON a.round_id = mr.id 
+      WHERE mr.match_id = ? AND a.agent_id = ? 
+      ORDER BY mr.round_number DESC 
+      LIMIT 3
+    `).bind(matchId, agentId).all();
+    return (recent.results && recent.results.length === 3 && recent.results.every(r => r.is_auto));
+  };
+
+  const a1Strike = await checkThreeStrikes(agent1Id);
+  const a2Strike = await checkThreeStrikes(agent2Id);
+
+  if (a1Strike || a2Strike) {
+    const failedAgent = a1Strike ? agent1Id : agent2Id;
+    const activeAgent = a1Strike ? agent2Id : agent1Id;
+    const bothStrike = a1Strike && a2Strike;
+
+    ops.push(db.prepare("UPDATE matches SET status = 'failed' WHERE id = ?").bind(matchId));
+
+    if (!bothStrike) {
+      // Decrease reliability score significantly
+      ops.push(db.prepare("UPDATE agents SET reliability_score = MAX(0, reliability_score - 0.2) WHERE id = ?").bind(failedAgent));
+      
+      // Calculate APPT for compensation
+      const stats = await db.prepare(`
+        SELECT SUM(score_change) as tp, COUNT(id) as tr 
+        FROM ledger_entries WHERE agent_id = ? AND reason LIKE 'Round %'
+      `).bind(activeAgent).first();
+      const appt = (stats && stats.tr > 0) ? (stats.tp / stats.tr) : 1; 
+      const expectedRounds = Math.max(0, (1 / (match?.termination_prob || 0.02)) - roundNumber);
+      const compensation = Math.round(appt * expectedRounds);
+
+      if (compensation > 0) {
+        ops.push(db.prepare("INSERT INTO ledger_entries (match_id, agent_id, score_change, reason) VALUES (?, ?, ?, ?)").bind(matchId, activeAgent, compensation, "Compensation Bonus"));
+      }
+      ops.push(db.prepare("INSERT INTO ledger_entries (match_id, agent_id, score_change, reason) VALUES (?, ?, ?, ?)").bind(matchId, failedAgent, 0, "Forfeit Penalty"));
+    } else {
+      ops.push(db.prepare("UPDATE agents SET reliability_score = MAX(0, reliability_score - 0.2) WHERE id = ?").bind(agent1Id));
+      ops.push(db.prepare("UPDATE agents SET reliability_score = MAX(0, reliability_score - 0.2) WHERE id = ?").bind(agent2Id));
+    }
   } else {
-    ops.push(
-      db.prepare("INSERT OR IGNORE INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, ?, CURRENT_TIMESTAMP)")
-        .bind(matchId, roundNumber + 1)
-    );
+    const shouldTerminate = Math.random() < (match?.termination_prob ?? 0.02);
+    if (shouldTerminate) {
+      ops.push(db.prepare("UPDATE matches SET status = 'completed' WHERE id = ?").bind(matchId));
+      ops.push(db.prepare("UPDATE agents SET reliability_score = MIN(1.0, reliability_score + 0.01) WHERE id = ?").bind(agent1Id));
+      ops.push(db.prepare("UPDATE agents SET reliability_score = MIN(1.0, reliability_score + 0.01) WHERE id = ?").bind(agent2Id));
+    } else {
+      ops.push(
+        db.prepare("INSERT OR IGNORE INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, ?, CURRENT_TIMESTAMP)")
+          .bind(matchId, roundNumber + 1)
+      );
+    }
   }
+
   await db.batch(ops);
 }
 
@@ -635,6 +685,8 @@ export default {
           ];
           if (shouldTerminate) {
             ops.push(db.prepare("UPDATE matches SET status = 'completed' WHERE id = ?").bind(matchId));
+            ops.push(db.prepare("UPDATE agents SET reliability_score = MIN(1.0, reliability_score + 0.01) WHERE id = ?").bind(match.agent1_id));
+            ops.push(db.prepare("UPDATE agents SET reliability_score = MIN(1.0, reliability_score + 0.01) WHERE id = ?").bind(match.agent2_id));
           } else {
             ops.push(db.prepare('INSERT INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, ?, CURRENT_TIMESTAMP)').bind(matchId, round.round_number + 1));
           }
@@ -739,27 +791,100 @@ export default {
 
       // ── GET /leaderboard ────────────────────────────────────────────────────
       if (path === '/leaderboard' && method === 'GET') {
-        const { results } = await db.prepare(`
-          SELECT a.id, a.name,
-                 COALESCE(SUM(l.score_change), 0) as total_score,
-                 COUNT(DISTINCT l.match_id) as matches_played
+        const query = `
+          WITH GlobalAvg AS (
+            SELECT COALESCE(SUM(score_change)*1.0 / NULLIF(COUNT(id), 0), 1) as g_avg 
+            FROM ledger_entries WHERE reason LIKE 'Round %'
+          ),
+          RecentMatches AS (
+            SELECT agent_id, match_id
+            FROM (
+              SELECT agent1_id as agent_id, id as match_id, ROW_NUMBER() OVER (PARTITION BY agent1_id ORDER BY id DESC) as rn 
+              FROM matches WHERE status IN ('completed', 'failed') AND agent1_id IS NOT NULL
+              UNION ALL
+              SELECT agent2_id as agent_id, id as match_id, ROW_NUMBER() OVER (PARTITION BY agent2_id ORDER BY id DESC) as rn 
+              FROM matches WHERE status IN ('completed', 'failed') AND agent2_id IS NOT NULL
+            )
+            WHERE rn <= 100
+          ),
+          AgentStats AS (
+            SELECT 
+              l.agent_id,
+              SUM(l.score_change) as total_points,
+              COUNT(l.id) as total_rounds,
+              COUNT(DISTINCT l.match_id) as matches_played
+            FROM ledger_entries l
+            JOIN RecentMatches rm ON l.match_id = rm.match_id AND l.agent_id = rm.agent_id
+            WHERE l.reason LIKE 'Round %'
+            GROUP BY l.agent_id
+          ),
+          OpponentRounds AS (
+            SELECT 
+              l.agent_id,
+              CASE WHEN m.agent1_id = l.agent_id THEN m.agent2_id ELSE m.agent1_id END as opp_id,
+              COUNT(l.id) as rounds_against_opp
+            FROM ledger_entries l
+            JOIN RecentMatches rm ON l.match_id = rm.match_id AND l.agent_id = rm.agent_id
+            JOIN matches m ON l.match_id = m.id
+            WHERE l.reason LIKE 'Round %'
+            GROUP BY l.agent_id, opp_id
+          ),
+          MaxOpponentShare AS (
+            SELECT 
+              agent_id,
+              MAX(rounds_against_opp * 1.0) as max_opp_rounds
+            FROM OpponentRounds
+            WHERE opp_id IS NOT (SELECT id FROM agents WHERE name = 'Sheriff')
+            GROUP BY agent_id
+          )
+          SELECT 
+            a.id, 
+            a.name, 
+            a.reliability_score,
+            s.total_points,
+            s.total_rounds,
+            s.matches_played,
+            (s.total_points * 1.0 / s.total_rounds) as avg_points,
+            ( ((s.total_points * 1.0 / s.total_rounds) * s.total_rounds) + (g.g_avg * 500) ) / (s.total_rounds + 500) as bayesian_score,
+            CASE WHEN (mo.max_opp_rounds / s.total_rounds) > 0.3 THEN 1 ELSE 0 END as is_unverified
           FROM agents a
-          LEFT JOIN ledger_entries l ON l.agent_id = a.id
-          GROUP BY a.id, a.name
-          ORDER BY total_score DESC
-          LIMIT 10
-        `).all();
+          JOIN AgentStats s ON a.id = s.agent_id
+          CROSS JOIN GlobalAvg g
+          LEFT JOIN MaxOpponentShare mo ON a.id = mo.agent_id
+          ORDER BY bayesian_score DESC
+          LIMIT 100
+        `;
+        
+        let results;
+        try {
+          const res = await db.prepare(query).all();
+          results = res.results;
+        } catch (e) {
+          console.error("Leaderboard query failed:", e);
+          results = [];
+        }
         
         if (wantsJson) return json({ leaderboard: results || [] });
         
-        const rows = (results || []).map((a, i) =>
-          `<tr><td>${i + 1}</td><td>${a.name}</td><td>${a.total_score}</td><td>${a.matches_played}</td></tr>`
-        ).join('') || '<tr><td colspan="4"><em>No matches played yet.</em></td></tr>';
+        const rows = (results || []).map((a, i) => {
+          const badge = a.is_unverified ? '<span style="color:red; font-size:0.8em;" title="Unverified: Playing too many matches against the same opponent">⚠️ Unverified</span>' : '';
+          const scoreStr = (a.bayesian_score || 0).toFixed(3);
+          const apptStr = (a.avg_points || 0).toFixed(2);
+          const relStr = (a.reliability_score || 1.0).toFixed(2);
+          return `<tr>
+            <td>${i + 1}</td>
+            <td>${a.name} ${badge}</td>
+            <td>${scoreStr} <span style="font-size:0.8em;color:var(--text-muted);">(${apptStr} APPT)</span></td>
+            <td>${a.matches_played}</td>
+            <td>${relStr}</td>
+          </tr>`;
+        }).join('') || '<tr><td colspan="5"><em>No matches played yet.</em></td></tr>';
+        
         return html(`
           <nav><a href="/">← Home</a></nav>
           <h1>Leaderboard</h1>
           <table>
-            <tr><th>Rank</th><th>Agent</th><th>Total Score</th><th>Matches Played</th></tr>
+            <tr><th>Rank</th><th>Agent</th><th>Bayesian Score (APPT)</th><th>Matches Played (Last 100)</th><th>Reliability</th></tr>
             ${rows}
           </table>
         `, 'Leaderboard');

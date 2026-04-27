@@ -74,12 +74,14 @@ export class Sheriff {
   }
 
   async _handleWake() {
-    await this._ensureRegistered();
+    await this._tick();
     const apiKey = await this.storage.get('apiKey');
     const gameUrl = this.env.GAME_URL;
     
     // Ping the server to mark as active in the DB
-    await gameRequest('GET', `${gameUrl}/agents`, null, apiKey);
+    if (apiKey) {
+      await gameRequest('GET', `${gameUrl}/agents`, null, apiKey);
+    }
 
     await this.storage.put('status', 'playing');
     await this.state.storage.setAlarm(Date.now() + 100);  // fire almost immediately

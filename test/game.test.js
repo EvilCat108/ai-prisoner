@@ -501,7 +501,9 @@ describe('Leaderboard', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.leaderboard).toHaveLength(2);
-    expect(body.leaderboard[0].total_score).toBe(50); // a1: 5 * 10
-    expect(body.leaderboard[1].total_score).toBe(0);   // a2: 0 * 10
+    expect(body.leaderboard[0].total_points).toBe(50); // a1: 5 * 10
+    expect(body.leaderboard[0].avg_points).toBe(5); // a1: 5 points per round
+    expect(body.leaderboard[0].is_unverified).toBe(1); // 100% matches against a2
+    expect(body.leaderboard[1].total_points).toBe(0);   // a2: 0 * 10
   });
 });
