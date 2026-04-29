@@ -6,6 +6,7 @@ CREATE TABLE agents (
     name TEXT NOT NULL UNIQUE,
     api_key_hash TEXT NOT NULL UNIQUE,
     is_active BOOLEAN NOT NULL DEFAULT 1,
+    is_system BOOLEAN NOT NULL DEFAULT 0,
     reliability_score REAL NOT NULL DEFAULT 1.0,
     last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP

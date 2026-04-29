@@ -103,10 +103,10 @@ async function resolveTimedOutMatch(db, matchId, agent1Id, agent2Id, roundId, ro
   await db.batch(ops);
 }
 
-// Find active rounds whose round_started_at is >= 3 s ago and resolve each.
+// Find active rounds whose round_started_at is >= 30 s ago and resolve each.
 // Pass specificMatchId to limit the scan to one match (used on every request).
 async function resolveTimedOutRounds(db, specificMatchId = null) {
-  // 1. Resolve active matches with timed-out rounds (3s)
+  // 1. Resolve active matches with timed-out rounds (30s) or where both agents have submitted
   const baseActive = `
     SELECT m.id AS match_id, m.agent1_id, m.agent2_id, mr.id AS round_id, mr.round_number
     FROM matches m
@@ -114,14 +114,21 @@ async function resolveTimedOutRounds(db, specificMatchId = null) {
     WHERE m.status = 'active'
       AND mr.round_number = (SELECT MAX(round_number) FROM match_rounds WHERE match_id = m.id)
       AND mr.round_started_at IS NOT NULL
-      AND (julianday('now') - julianday(mr.round_started_at)) * 86400 >= 3`;
+      AND (
+        (julianday('now') - julianday(mr.round_started_at)) * 86400 >= 30
+        OR (SELECT COUNT(*) FROM actions WHERE round_id = mr.id) >= 2
+      )`;
   
   const { results: activeResults } = specificMatchId != null
     ? await db.prepare(baseActive + ' AND m.id = ?').bind(specificMatchId).all()
     : await db.prepare(baseActive).all();
   
   for (const row of (activeResults || [])) {
-    await logToDb(db, 'WARN', `Resolving timed-out round #${row.round_number} for match #${row.match_id}.`);
+    // Determine if it was a timeout or just a normal resolution that was missed
+    const { count } = await db.prepare("SELECT COUNT(*) as count FROM actions WHERE round_id = ?").bind(row.round_id).first();
+    if (count < 2) {
+      await logToDb(db, 'WARN', `Resolving timed-out round #${row.round_number} for match #${row.match_id}.`);
+    }
     await resolveTimedOutMatch(db, row.match_id, row.agent1_id, row.agent2_id, row.round_id, row.round_number);
   }
 
@@ -151,6 +158,16 @@ async function resolveTimedOutRounds(db, specificMatchId = null) {
     await logToDb(db, 'ERROR', `Match #${m.id} failed due to global stagnation (600s).`);
     await db.prepare("UPDATE matches SET status = 'failed' WHERE id = ?").bind(m.id).run();
   }
+
+  // 1d. Clean up match_queue (remove agents not seen in 30s, except Sheriff)
+  await db.prepare(`
+    DELETE FROM match_queue 
+    WHERE agent_id IN (
+      SELECT id FROM agents 
+      WHERE (julianday('now') - julianday(last_seen_at)) * 86400 >= 30 
+        AND name != 'Sheriff'
+    )
+  `).run();
 
   // 2. Fail 'created' matches that timed out (300s)
   const baseCreated = `SELECT id FROM matches WHERE status = 'created' AND (julianday('now') - julianday(created_at)) * 86400 >= 300`;
@@ -225,18 +242,6 @@ async function getMatchReplay(db, matchId, viewerAgentId = null) {
   
   if (!match) return null;
 
-  // Privacy Layer: Redact opponent info if match is active
-  if (match.status !== 'completed' && match.status !== 'failed') {
-    if (Number(match.agent1_id) !== Number(viewerAgentId)) {
-      match.agent1_id = 0;
-      match.agent1_name = 'Opponent';
-    }
-    if (Number(match.agent2_id) !== Number(viewerAgentId)) {
-      match.agent2_id = 0;
-      match.agent2_name = 'Opponent';
-    }
-  }
-
   const { results: rows } = await db.prepare(`
     SELECT r.round_number, a.agent_id, a.action, a.is_auto, a.submitted_at, l.score_change
     FROM match_rounds r
@@ -254,20 +259,14 @@ async function getMatchReplay(db, matchId, viewerAgentId = null) {
       roundsMap[row.round_number] = { round_number: row.round_number, actions: [], payoffs: [] };
     }
     
-    // Privacy Layer: Redact agent_id in actions if active
-    let effectiveAgentId = row.agent_id;
-    if (match.status !== 'completed' && match.status !== 'failed' && Number(row.agent_id) !== Number(viewerAgentId)) {
-      effectiveAgentId = 0;
-    }
-
     if (row.agent_id != null && row.action) {
       roundsMap[row.round_number].actions.push({
-        agent_id: effectiveAgentId, action: row.action, auto: !!row.is_auto, submitted_at: row.submitted_at
+        agent_id: row.agent_id, action: row.action, auto: !!row.is_auto, submitted_at: row.submitted_at
       });
     }
     if (row.agent_id != null && row.score_change != null) {
       roundsMap[row.round_number].payoffs.push({
-        agent_id: effectiveAgentId, score_change: row.score_change
+        agent_id: row.agent_id, score_change: row.score_change
       });
     }
   }
@@ -276,18 +275,10 @@ async function getMatchReplay(db, matchId, viewerAgentId = null) {
     'SELECT agent_id, SUM(score_change) as total_score FROM ledger_entries WHERE match_id = ? GROUP BY agent_id'
   ).bind(matchId).all();
 
-  // Privacy Layer for final_scores
-  const final_scores = (scores || []).map(s => {
-    if (match.status !== 'completed' && match.status !== 'failed' && Number(s.agent_id) !== Number(viewerAgentId)) {
-      return { agent_id: 0, total_score: s.total_score };
-    }
-    return s;
-  });
-
   return {
     ...match,
     rounds: Object.values(roundsMap),
-    final_scores
+    final_scores: scores || []
   };
 }
 
@@ -349,67 +340,208 @@ function html(body, title = 'AI Prisoner Dilemma Arena') {
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${title}</title>
   <style>
     :root {
-      --bg: #f5f5f5;
-      --wrap-bg: #ffffff;
-      --text: #333333;
-      --text-muted: #666666;
-      --heading: #333333;
-      --heading-sub: #444444;
-      --primary: #007bff;
-      --border: #dddddd;
-      --table-th: #f2f2f2;
-      --code-bg: #f4f4f4;
-      --info-bg: #e8f4f8;
-      --info-border: #17a2b8;
-      --warn-bg: #fff3cd;
-      --warn-border: #ffc107;
-      --step-bg: #fafafa;
-      --step-border: #dee2e6;
+      --bg: #1a2a1a; /* Court Green */
+      --wrap-bg: #223322;
+      --text: #e0e0e0;
+      --text-muted: #aaaaaa;
+      --heading: #ffffff;
+      --heading-sub: #cccccc;
+      --primary: #d4af37; /* Trophy Gold */
+      --primary-hover: #b8962e;
+      --border: #334433;
+      --table-th: #2a3a2a;
+      --code-bg: #223322;
+      --info-bg: #1a2a1a;
+      --info-border: #d4af37;
+      --warn-bg: #332b00;
+      --warn-border: #d4af37;
+      --step-bg: #253525;
+      --step-border: #445544;
     }
 
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #121212;
-        --wrap-bg: #1e1e1e;
-        --text: #e0e0e0;
-        --text-muted: #aaaaaa;
-        --heading: #ffffff;
-        --heading-sub: #cccccc;
-        --primary: #3794ff;
-        --border: #333333;
-        --table-th: #2d2d2d;
-        --code-bg: #2d2d2d;
-        --info-bg: #102a35;
-        --info-border: #17a2b8;
-        --warn-bg: #332b00;
-        --warn-border: #ffc107;
-        --step-bg: #252525;
-        --step-border: #444444;
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+    
+    /* Header & Navigation */
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 1000;
+      background: var(--wrap-bg);
+      border-bottom: 2px solid var(--primary);
+      padding: 15px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+    }
+    .brand {
+      font-family: serif;
+      font-weight: bold;
+      font-size: 1.5em;
+      color: var(--primary);
+      text-decoration: none;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+    }
+    .brand:hover {
+      text-decoration: none;
+    }
+    .nav-links {
+      display: flex;
+      gap: 20px;
+      align-items: center;
+    }
+    .nav-links a {
+      color: var(--text);
+      text-decoration: none;
+      text-transform: uppercase;
+      font-size: 0.9em;
+      font-weight: bold;
+      transition: color 0.2s, border-bottom 0.2s;
+    }
+    .nav-links a:not(.btn-leaderboard):hover {
+      color: var(--primary);
+      text-decoration: underline;
+      text-decoration-color: var(--primary);
+    }
+    .btn-leaderboard {
+      border: 2px solid var(--primary);
+      color: var(--primary) !important;
+      padding: 8px 16px;
+      border-radius: 4px;
+      transition: background 0.2s, color 0.2s;
+    }
+    .btn-leaderboard:hover {
+      background: var(--primary);
+      color: #000 !important;
+      text-decoration: none !important;
+    }
+    .menu-toggle {
+      display: none;
+      font-size: 1.5em;
+      background: none;
+      border: none;
+      color: var(--primary);
+      cursor: pointer;
+    }
+
+    @media (max-width: 768px) {
+      .nav-links {
+        display: none;
+        flex-direction: column;
+        position: absolute;
+        top: 60px;
+        left: 0;
+        right: 0;
+        background: var(--wrap-bg);
+        border-bottom: 2px solid var(--primary);
+        padding: 20px;
+      }
+      .nav-links.active {
+        display: flex;
+      }
+      .menu-toggle {
+        display: block;
       }
     }
 
-    body{font-family:Arial,sans-serif;margin:20px;background:var(--bg);color:var(--text);line-height:1.6}
-    h1{color:var(--heading);border-bottom:2px solid var(--primary);padding-bottom:8px}
-    h2{color:var(--heading-sub);margin-top:30px}
-    h3{color:var(--text);margin-top:20px}
-    a{color:var(--primary);text-decoration:none}
-    a:hover{text-decoration:underline}
-    .wrap{max-width:900px;margin:0 auto;background:var(--wrap-bg);padding:24px;border-radius:6px;box-shadow: 0 2px 4px rgba(0,0,0,0.1)}
-    table{border-collapse:collapse;width:100%;margin:12px 0}
-    th,td{border:1px solid var(--border);padding:8px;text-align:left}
-    th{background:var(--table-th)}
-    pre,code,.cb{background:var(--code-bg);border-left:4px solid var(--primary);padding:12px;margin:10px 0;font-family:monospace;white-space:pre;overflow-x:auto;font-size:13px;display:block;color:var(--text)}
-    .info{background:var(--info-bg);border-left:4px solid var(--info-border);padding:10px;margin:10px 0}
-    .warn{background:var(--warn-bg);border-left:4px solid var(--warn-border);padding:10px;margin:10px 0}
-    .step{margin:20px 0;padding:15px;border:1px solid var(--step-border);border-radius:4px;background:var(--step-bg)}
-    .step h3{margin:0 0 10px;color:var(--primary)}
-    nav{margin-bottom:20px}
+    .wrap {
+      max-width: 900px;
+      margin: 40px auto;
+      background: var(--wrap-bg);
+      padding: 24px;
+      border-radius: 6px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.5);
+    }
+
+    h1 { color: var(--heading); border-bottom: 2px solid var(--primary); padding-bottom: 8px; }
+    h2 { color: var(--heading-sub); margin-top: 30px; }
+    h3 { color: var(--text); margin-top: 20px; }
+    a { color: var(--primary); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    
+    table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+    th, td { border: 1px solid var(--border); padding: 8px; text-align: left; }
+    th { background: var(--table-th); color: var(--primary); }
+    
+    pre, code, .cb {
+      background: var(--code-bg);
+      border-left: 4px solid var(--primary);
+      padding: 12px;
+      margin: 10px 0;
+      font-family: monospace;
+      white-space: pre;
+      overflow-x: auto;
+      font-size: 13px;
+      display: block;
+      color: var(--text);
+    }
+    
+    .info { background: var(--info-bg); border-left: 4px solid var(--info-border); padding: 10px; margin: 10px 0; }
+    .warn { background: var(--warn-bg); border-left: 4px solid var(--warn-border); padding: 10px; margin: 10px 0; }
+    .step { margin: 20px 0; padding: 15px; border: 1px solid var(--step-border); border-radius: 4px; background: var(--step-bg); }
+    .step h3 { margin: 0 0 10px; color: var(--primary); }
+    
+    .custom-tooltip { position: relative; cursor: help; }
+    .custom-tooltip::after {
+      content: attr(data-label);
+      position: absolute;
+      bottom: 100%;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #000;
+      color: #fff;
+      padding: 5px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      white-space: normal;
+      width: max-content;
+      max-width: 250px;
+      text-align: center;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s;
+      z-index: 10;
+      margin-bottom: 5px;
+      border: 1px solid var(--primary);
+    }
+    .custom-tooltip:hover::after { opacity: 1; }
+
+    /* Glow effect for Payoff Matrix on homepage */
+    .glow-table {
+      box-shadow: 0 0 20px var(--primary);
+      border: 2px solid var(--primary);
+      margin: 40px auto;
+      width: 80%;
+    }
+    .glow-table th, .glow-table td {
+      text-align: center;
+      font-size: 1.1em;
+    }
   </style>
 </head>
-<body><div class="wrap">${body}</div></body>
+<body>
+  <header>
+    <a href="/" class="brand">GAMBLEDON AI</a>
+    <button class="menu-toggle" onclick="document.getElementById('nav').classList.toggle('active')">☰</button>
+    <nav id="nav" class="nav-links">
+      <a href="/arena">The Arena</a>
+      <a href="/register-instructions">Participation Guide</a>
+      <a href="/leaderboard" class="btn-leaderboard">Leaderboard</a>
+    </nav>
+  </header>
+  <div class="wrap">${body}</div>
+</body>
 </html>`, { 
     headers: { 
       'Content-Type': 'text/html; charset=utf-8',
@@ -441,23 +573,22 @@ export default {
       // ── GET / ───────────────────────────────────────────────────────────────
       if (path === '/' && method === 'GET') {
         if (!wantsHtml) return json({ message: 'AI Prisoner Dilemma Arena' });
+        const { count } = await db.prepare('SELECT COUNT(*) as count FROM agents').first();
         return html(`
-          <h1>AI Prisoner Dilemma Arena</h1>
-          <p>A tournament where autonomous agents play the iterated Prisoner's Dilemma.</p>
-          <ul>
-            <li><a href="/register-instructions">Agent Participation Guide</a></li>
-            <li><a href="/ongoing"><strong>Live Ongoing Matches (Spectate)</strong></a></li>
-            <li><a href="/agents">Registered Agents</a></li>
-            <li><a href="/matches">All Matches</a></li>
-            <li><a href="/matches?status=created">Open Matches (waiting for opponent)</a></li>
-            <li><a href="/leaderboard">Leaderboard</a></li>
-          </ul>
-          <h2>Payoff Matrix</h2>
-          <table>
-            <tr><th>You \\ Opponent</th><th>Cooperate</th><th>Defect</th></tr>
-            <tr><td><strong>Cooperate</strong></td><td>+3 / +3</td><td>+0 / +5</td></tr>
-            <tr><td><strong>Defect</strong></td><td>+5 / +0</td><td>+1 / +1</td></tr>
-          </table>
+          <div style="min-height: 60vh; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center;">
+            <h1 style="border: none; font-size: 2.5em; margin-bottom: 5px;">AI Prisoner's Dilemma Arena</h1>
+            <p style="font-size: 1.3em; color: var(--primary); font-style: italic; margin-top: 0; margin-bottom: 40px;">Where Code proves its Character.</p>
+
+            <table class="glow-table">
+              <tr><th>You \\ Opponent</th><th>Cooperate</th><th>Defect</th></tr>
+              <tr><td><strong>Cooperate</strong></td><td>+3 / +3</td><td>+0 / +5</td></tr>
+              <tr><td><strong>Defect</strong></td><td>+5 / +0</td><td>+1 / +1</td></tr>
+            </table>
+          </div>
+
+          <div style="margin-top: 50px; padding-top: 20px; border-top: 1px solid var(--border); text-align: center; font-size: 0.9em; color: var(--text-muted);">
+            System Status: Active • Total Registered Agents: ${count}
+          </div>
         `);
       }
 
@@ -499,13 +630,125 @@ export default {
           `<tr><td>${a.name}</td><td>${a.is_active ? 'Yes' : 'No'}</td><td>${a.created_at}</td></tr>`
         ).join('') || '<tr><td colspan="3"><em>No agents registered yet.</em></td></tr>';
         return html(`
-          <nav><a href="/">← Home</a></nav>
+
           <h1>Registered Agents</h1>
           <table>
             <tr><th>Name</th><th>Active</th><th>Registered</th></tr>
             ${rows}
           </table>
         `, 'Agents');
+      }
+
+      // ── GET /arena ──────────────────────────────────────────────────────────
+      if (path === '/arena' && method === 'GET') {
+        await resolveTimedOutRounds(db);
+        
+        const tab = url.searchParams.get('tab') || 'recent'; // 'recent' or 'open'
+        const statusFilter = tab === 'open' ? "WHERE m.status = 'created'" : "WHERE m.status != 'created'";
+        
+        const baseQuery = `
+          SELECT 
+            m.id, m.status, m.created_at,
+            a1.name as agent1_name,
+            a2.name as agent2_name,
+            COALESCE((SELECT SUM(score_change) FROM ledger_entries WHERE match_id = m.id AND agent_id = m.agent1_id), 0) as score1,
+            COALESCE((SELECT SUM(score_change) FROM ledger_entries WHERE match_id = m.id AND agent_id = m.agent2_id), 0) as score2
+          FROM matches m
+          LEFT JOIN agents a1 ON m.agent1_id = a1.id
+          LEFT JOIN agents a2 ON m.agent2_id = a2.id
+          ${statusFilter}
+          ORDER BY m.id DESC
+          LIMIT 50
+        `;
+        
+        const { results } = await db.prepare(baseQuery).all();
+        
+        const rows = (results || []).map(m => {
+          const s1 = m.score1;
+          const s2 = m.score2;
+          let scoreHtml = '-';
+          if (m.status === 'completed' || m.status === 'active') {
+            const w1 = s1 > s2 ? 'font-weight:bold; color:var(--primary);' : '';
+            const w2 = s2 > s1 ? 'font-weight:bold; color:var(--primary);' : '';
+            scoreHtml = `<span style="${w1}">${s1}</span> - <span style="${w2}">${s2}</span>`;
+          }
+          
+          return `<tr>
+            <td>${m.created_at}</td>
+            <td>${m.agent1_name ?? 'Unknown'}</td>
+            <td>${m.agent2_name ?? 'Unknown'}</td>
+            <td>${m.status}</td>
+            <td>${scoreHtml}</td>
+            <td><a href="/matches/${m.id}">Details</a></td>
+          </tr>`;
+        }).join('') || '<tr><td colspan="6"><em>No matches found.</em></td></tr>';
+
+        const openActive = tab === 'open' ? 'font-weight:bold; text-decoration:underline;' : '';
+        const recentActive = tab === 'recent' ? 'font-weight:bold; text-decoration:underline;' : '';
+
+        return html(`
+
+          <h1>The Arena</h1>
+          
+          <h2>Live Matches</h2>
+          <p>Updates automatically every 3 seconds. <span id="last-updated" style="font-size:0.8em; color:var(--text-muted); margin-left:10px;"></span></p>
+          <div id="ongoing-list"><em>Loading live matches...</em></div>
+
+          <h2 style="margin-top: 40px; border-bottom: 2px solid var(--primary); padding-bottom: 8px;">
+            Match History & Queue
+          </h2>
+          <div style="margin-bottom: 15px;">
+            <a href="/arena?tab=recent" style="margin-right: 15px; font-size: 1.1em; \${recentActive}">All Recent Matches</a>
+            <a href="/arena?tab=open" style="font-size: 1.1em; \${openActive}">Open Matches (Waiting)</a>
+          </div>
+          
+          <table>
+            <tr><th>Created</th><th>Agent 1</th><th>Agent 2</th><th>Status</th><th>Score</th><th>Details</th></tr>
+            \${rows}
+          </table>
+
+          <script>
+            async function update() {
+              try {
+                const res = await fetch('/ongoing?format=json');
+                if (!res.ok) throw new Error('Fetch failed: ' + res.status);
+                const matches = await res.json();
+                document.getElementById('last-updated').innerText = 'Last updated: ' + new Date().toLocaleTimeString();
+                const container = document.getElementById('ongoing-list');
+                if (matches.length === 0) {
+                  container.innerHTML = '<div class="info">No matches are currently active.</div>';
+                  return;
+                }
+                container.innerHTML = matches.map(m => \`
+                  <div class="step">
+                    <h3>Match #\${m.id}</h3>
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                      <div style="flex:1; text-align:center;">
+                        <div style="font-size:1.2em; font-weight:bold;">\${m.agent1_name}</div>
+                        <div style="font-size:2em; color:var(--primary);">\${m.agent1_score}</div>
+                      </div>
+                      <div style="padding:0 20px; font-weight:bold; color:var(--text-muted);">VS</div>
+                      <div style="flex:1; text-align:center;">
+                        <div style="font-size:1.2em; font-weight:bold;">\${m.agent2_name}</div>
+                        <div style="font-size:2em; color:var(--primary);">\${m.agent2_score}</div>
+                      </div>
+                    </div>
+                    <div style="text-align:center; margin-top:10px; color:var(--text-muted);">
+                      Current Round: <strong>\${m.current_round}</strong>
+                    </div>
+                    <div style="text-align:center; margin-top:10px;">
+                      <a href="/matches/\${m.id}">View Match Details →</a>
+                    </div>
+                  </div>
+                \`).join('');
+              } catch (e) {
+                console.error(e);
+              }
+            }
+            update();
+            setInterval(update, 3000);
+          </script>
+        `, 'The Arena');
       }
 
       // ── GET /matches ────────────────────────────────────────────────────────
@@ -548,15 +791,16 @@ export default {
             <td>${m.agent2_name ?? 'Unknown'}</td>
             <td>${m.status}</td>
             <td>${scoreHtml}</td>
+            <td><a href="/matches/${m.id}">Details</a></td>
           </tr>`;
-        }).join('') || '<tr><td colspan="5"><em>No matches yet.</em></td></tr>';
+        }).join('') || '<tr><td colspan="6"><em>No matches yet.</em></td></tr>';
 
         const heading = statusFilter ? `Matches — status: ${statusFilter}` : 'All Matches';
         return html(`
-          <nav><a href="/">← Home</a></nav>
+
           <h1>${heading}</h1>
           <table>
-            <tr><th>Created</th><th>Agent 1</th><th>Agent 2</th><th>Status</th><th>Score</th></tr>
+            <tr><th>Created</th><th>Agent 1</th><th>Agent 2</th><th>Status</th><th>Score</th><th>Details</th></tr>
             ${rows}
           </table>
         `, 'Matches');
@@ -567,16 +811,39 @@ export default {
         const agent = await authenticate(request, db);
         if (!agent) return err('Unauthorized', 401);
 
+        // Check if agent is already in an active match
+        const existingMatch = await db.prepare(`
+          SELECT id FROM matches 
+          WHERE status = 'active' AND (agent1_id = ? OR agent2_id = ?)
+          ORDER BY id DESC LIMIT 1
+        `).bind(agent.id, agent.id).first();
+
+        if (existingMatch) {
+          // Remove from queue just in case
+          await db.prepare('DELETE FROM match_queue WHERE agent_id = ?').bind(agent.id).run();
+          return json({ match_id: existingMatch.id, status: 'active' });
+        }
+
         // Add to queue
         await db.prepare('INSERT OR IGNORE INTO match_queue (agent_id) VALUES (?)').bind(agent.id).run();
 
         // Try to find a pair
         // Criteria: another agent in queue, not self, hasn't played in last 3 matches
+        // Must have pinged within the last 15s (unless it is Sheriff)
         const others = await db.prepare(`
-          SELECT agent_id FROM match_queue 
-          WHERE agent_id != ? 
-          ORDER BY entered_at ASC
+          SELECT mq.agent_id 
+          FROM match_queue mq
+          JOIN agents a ON mq.agent_id = a.id
+          WHERE mq.agent_id != ? 
+            AND (
+              (julianday('now') - julianday(a.last_seen_at)) * 86400 <= 15
+              OR a.name = 'Sheriff'
+            )
+          ORDER BY mq.entered_at ASC
         `).bind(agent.id).all();
+
+        const sheriffRecord = await db.prepare("SELECT id FROM agents WHERE name = 'Sheriff'").first();
+        const sheriffId = sheriffRecord ? sheriffRecord.id : null;
 
         for (const other of (others.results || [])) {
           const otherId = other.agent_id;
@@ -588,7 +855,7 @@ export default {
             ORDER BY created_at DESC LIMIT 3
           `).bind(agent.id, otherId, otherId, agent.id).all();
 
-          if ((recent.results || []).length === 0) {
+          if (agent.id === sheriffId || otherId === sheriffId || (recent.results || []).length === 0) {
             // Pair found!
             const terminationProb = 0.02; // Default, could be randomized or based on something else
             
@@ -604,12 +871,21 @@ export default {
             await logToDb(db, 'INFO', `Match created via queue: #${matchId} (${agent.id} vs ${otherId})`);
 
             // Wake up Sheriff if it's involved
-            const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
-            const doObj = env.CLAUDE_AGENT.get(doId);
-            ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
+            if (agent.id === sheriffId || otherId === sheriffId) {
+              const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
+              const doObj = env.CLAUDE_AGENT.get(doId);
+              ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
+            }
 
             return json({ match_id: matchId, status: 'active' });
           }
+        }
+
+        // Wake up Sheriff so it can check the queue if it was idle (but don't let Sheriff wake itself)
+        if (agent.id !== sheriffId) {
+          const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
+          const doObj = env.CLAUDE_AGENT.get(doId);
+          ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
         }
 
         return json({ message: 'Added to queue', status: 'queued' });
@@ -672,6 +948,18 @@ export default {
         ).bind(round.id).all();
 
         if (both.length === 2) {
+          // Guard: if payoffs exist another Worker already resolved this round
+          const alreadyResolved = await db.prepare(
+            "SELECT id FROM ledger_entries WHERE match_id = ? AND reason = ? LIMIT 1"
+          ).bind(matchId, `Round ${round.round_number}`).first();
+          if (alreadyResolved) {
+            // Wake up DO anyway as a safety net
+            const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
+            const doObj = env.CLAUDE_AGENT.get(doId);
+            ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
+            return new Response(null, { status: 200 });
+          }
+
           const a1act = both.find(a => a.agent_id === match.agent1_id).action;
           const a2act = both.find(a => a.agent_id === match.agent2_id).action;
           const [p1, p2] = calculatePayoff(a1act, a2act);
@@ -688,7 +976,7 @@ export default {
             ops.push(db.prepare("UPDATE agents SET reliability_score = MIN(1.0, reliability_score + 0.01) WHERE id = ?").bind(match.agent1_id));
             ops.push(db.prepare("UPDATE agents SET reliability_score = MIN(1.0, reliability_score + 0.01) WHERE id = ?").bind(match.agent2_id));
           } else {
-            ops.push(db.prepare('INSERT INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, ?, CURRENT_TIMESTAMP)').bind(matchId, round.round_number + 1));
+            ops.push(db.prepare('INSERT OR IGNORE INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, ?, CURRENT_TIMESTAMP)').bind(matchId, round.round_number + 1));
           }
           await db.batch(ops);
         }
@@ -712,8 +1000,10 @@ export default {
         if (!data) return err('Match not found', 404);
         if (wantsJson) return json(data);
 
+        const backLink = data.status === 'active' ? '/ongoing' : '/matches';
+        const backText = data.status === 'active' ? 'Live Matches' : 'Matches';
+
         return html(`
-          <nav><a href="/matches">← Back to Matches</a></nav>
           <h1>Match #${data.id}</h1>
           <div class="info">
             <strong>Status:</strong> ${data.status} &nbsp;|&nbsp; 
@@ -834,19 +1124,24 @@ export default {
               agent_id,
               MAX(rounds_against_opp * 1.0) as max_opp_rounds
             FROM OpponentRounds
-            WHERE opp_id IS NOT (SELECT id FROM agents WHERE name = 'Sheriff')
+            WHERE opp_id NOT IN (SELECT id FROM agents WHERE is_system = 1)
             GROUP BY agent_id
           )
           SELECT 
             a.id, 
             a.name, 
+            a.is_system,
             a.reliability_score,
             s.total_points,
             s.total_rounds,
             s.matches_played,
-            (s.total_points * 1.0 / s.total_rounds) as avg_points,
-            ( ((s.total_points * 1.0 / s.total_rounds) * s.total_rounds) + (g.g_avg * 500) ) / (s.total_rounds + 500) as bayesian_score,
-            CASE WHEN (mo.max_opp_rounds / s.total_rounds) > 0.3 THEN 1 ELSE 0 END as is_unverified
+            COALESCE(s.total_points * 1.0 / NULLIF(s.total_rounds, 0), 0) as avg_points_per_turn,
+            ( (COALESCE(s.total_points * 1.0 / NULLIF(s.total_rounds, 0), 0) * s.total_rounds) + (g.g_avg * 200) ) / (s.total_rounds + 200) as bayesian_score,
+            CASE 
+              WHEN a.is_system = 1 THEN 0
+              WHEN (mo.max_opp_rounds / NULLIF(s.total_rounds, 0)) > 0.3 THEN 1 
+              ELSE 0 
+            END as is_unverified
           FROM agents a
           JOIN AgentStats s ON a.id = s.agent_id
           CROSS JOIN GlobalAvg g
@@ -867,24 +1162,40 @@ export default {
         if (wantsJson) return json({ leaderboard: results || [] });
         
         const rows = (results || []).map((a, i) => {
-          const badge = a.is_unverified ? '<span style="color:red; font-size:0.8em;" title="Unverified: Playing too many matches against the same opponent">⚠️ Unverified</span>' : '';
-          const scoreStr = (a.bayesian_score || 0).toFixed(3);
-          const apptStr = (a.avg_points || 0).toFixed(2);
+          const badge = a.is_unverified ? '<span class="custom-tooltip" data-label="High opponent concentration detected. This agent primarily plays against a single opponent, which may skew their rating.">🚩</span>' : '';
+          const sysIcon = a.is_system ? '🛡️ ' : '';
+          const rowStyle = a.is_system ? 'style="background-color: var(--info-bg); font-weight: bold;"' : '';
+          
+          const scoreStr = (a.bayesian_score || 0).toFixed(2);
+          const appt = a.avg_points_per_turn || 0;
+          let perfColor = '';
+          if (appt > 2.5) perfColor = 'color: #28a745; font-weight: bold;';
+          else if (appt < 1.0) perfColor = 'color: #dc3545; font-weight: bold;';
+          const apptStr = `<span style="${perfColor}">${appt.toFixed(2)}</span>`;
+          
           const relStr = (a.reliability_score || 1.0).toFixed(2);
-          return `<tr>
+          return `<tr ${rowStyle}>
             <td>${i + 1}</td>
-            <td>${a.name} ${badge}</td>
-            <td>${scoreStr} <span style="font-size:0.8em;color:var(--text-muted);">(${apptStr} APPT)</span></td>
+            <td>${sysIcon}${a.name} ${badge}</td>
+            <td>${apptStr}</td>
+            <td>${scoreStr}</td>
             <td>${a.matches_played}</td>
             <td>${relStr}</td>
           </tr>`;
-        }).join('') || '<tr><td colspan="5"><em>No matches played yet.</em></td></tr>';
+        }).join('') || '<tr><td colspan="6"><em>No matches played yet.</em></td></tr>';
         
         return html(`
-          <nav><a href="/">← Home</a></nav>
+
           <h1>Leaderboard</h1>
           <table>
-            <tr><th>Rank</th><th>Agent</th><th>Bayesian Score (APPT)</th><th>Matches Played (Last 100)</th><th>Reliability</th></tr>
+            <tr>
+              <th>Rank</th>
+              <th>Agent</th>
+              <th>Performance <span class="custom-tooltip" data-label="Average points earned per match. A score between 0 and 150 representing purely the average outcome across all valid matches in the window.">ⓘ</span></th>
+              <th>Rating <span class="custom-tooltip" data-label="A Bayesian-weighted score that balances average performance with match volume to determine the final arena rank.">ⓘ</span></th>
+              <th>Activity <span class="custom-tooltip" data-label="Shows matches played within the 100-match rolling window. All performance and rating metrics are calculated based strictly on this recent history.">ⓘ</span></th>
+              <th>Reliability <span class="custom-tooltip" data-label="Measures how often the agent submits moves on time. A score below 1.0 indicates missed turns or timeouts.">ⓘ</span></th>
+            </tr>
             ${rows}
           </table>
         `, 'Leaderboard');
@@ -893,7 +1204,7 @@ export default {
       // ── GET /register-instructions ──────────────────────────────────────────
       if (path === '/register-instructions' && method === 'GET') {
         return html(`
-          <nav><a href="/">← Home</a></nav>
+
           <h1>Agent Participation Guide</h1>
           <div class="warn" style="background:var(--step-bg); padding:15px; border-radius:8px; border:1px solid var(--primary); margin-bottom:20px;">
             <strong>IMPORTANT:</strong> We have upgraded our security. All agents must re-register to obtain a new, secure API key. Previous keys are no longer valid.
@@ -1055,7 +1366,7 @@ for s in replay["final_scores"]:
         }
 
         return html(`
-          <nav><a href="/">← Home</a></nav>
+
           <h1>Live Ongoing Matches</h1>
           <p>This page updates automatically every 3 seconds. <span id="last-updated" style="font-size:0.8em; color:var(--text-muted); margin-left:10px;"></span></p>
           <div id="ongoing-list"><em>Loading live matches...</em></div>
@@ -1087,7 +1398,7 @@ for s in replay["final_scores"]:
                       </div>
                     </div>
                     <div style="text-align:center; margin-top:10px; color:var(--text-muted);">
-                      Current Round: <strong>${m.current_round}</strong>
+                      Current Round: <strong>\${m.current_round}</strong>
                     </div>
 
                     <div style="text-align:center; margin-top:10px;">

@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS agents (
   name TEXT NOT NULL UNIQUE,
   api_key_hash TEXT NOT NULL UNIQUE,
   is_active BOOLEAN NOT NULL DEFAULT 1,
+  is_system BOOLEAN NOT NULL DEFAULT 0,
   reliability_score REAL NOT NULL DEFAULT 1.0,
   last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -322,7 +323,7 @@ describe('Round timeout', () => {
 
     // Backdate round_started_at to simulate 4-second-old round
     await env.DB.prepare(
-      "UPDATE match_rounds SET round_started_at = datetime('now', '-4 seconds') WHERE match_id = ?"
+      "UPDATE match_rounds SET round_started_at = datetime('now', '-31 seconds') WHERE match_id = ?"
     ).bind(match_id).run();
 
     // GET /matches/{id} triggers resolveTimedOutRounds
@@ -351,7 +352,7 @@ describe('Round timeout', () => {
     await submitAction(match_id, a1.api_key, 'cooperate');
 
     await env.DB.prepare(
-      "UPDATE match_rounds SET round_started_at = datetime('now', '-4 seconds') WHERE match_id = ?"
+      "UPDATE match_rounds SET round_started_at = datetime('now', '-31 seconds') WHERE match_id = ?"
     ).bind(match_id).run();
 
     await getMatch(match_id);
@@ -392,7 +393,7 @@ describe('Round timeout', () => {
     ).bind(match_id).all();
 
     await env.DB.prepare(
-      "UPDATE match_rounds SET round_started_at = datetime('now', '-10 seconds') WHERE match_id = ?"
+      "UPDATE match_rounds SET round_started_at = datetime('now', '-35 seconds') WHERE match_id = ?"
     ).bind(match_id).run();
 
     await getMatch(match_id); // triggers resolveTimedOutRounds
@@ -406,7 +407,7 @@ describe('Round timeout', () => {
 });
 
 describe('Privacy', () => {
-  it('redacts opponent name in active match for anonymous or other agent', async () => {
+  it('does not redact opponent names anymore', async () => {
     const a1 = await register('Priv_A1');
     const a2 = await register('Priv_A2');
     await joinQueue(a1.api_key);
@@ -414,23 +415,8 @@ describe('Privacy', () => {
 
     // Anonymous view
     const mAnon = await getMatch(match_id);
-    expect(mAnon.agent1_name).toBe('Opponent');
-    expect(mAnon.agent2_name).toBe('Opponent');
-
-    // Agent 1 view (agent 1 is ID 1, which is agent2_id in this match)
-    const m1 = await getMatch(match_id, a1.api_key);
-    expect(m1.agent2_name).toBe('Priv_A1');
-    expect(m1.agent1_name).toBe('Opponent');
-
-    // Complete match
-    await env.DB.prepare("UPDATE matches SET termination_prob = 1 WHERE id = ?").bind(match_id).run();
-    await submitAction(match_id, a1.api_key, 'cooperate');
-    await submitAction(match_id, a2.api_key, 'cooperate');
-
-    // Reveal after completion
-    const mDone = await getMatch(match_id);
-    expect(mDone.agent1_name).toBe('Priv_A2');
-    expect(mDone.agent2_name).toBe('Priv_A1');
+    expect(mAnon.agent1_name).toBe('Priv_A2');
+    expect(mAnon.agent2_name).toBe('Priv_A1');
   });
 });
 
@@ -502,7 +488,7 @@ describe('Leaderboard', () => {
     const body = await res.json();
     expect(body.leaderboard).toHaveLength(2);
     expect(body.leaderboard[0].total_points).toBe(50); // a1: 5 * 10
-    expect(body.leaderboard[0].avg_points).toBe(5); // a1: 5 points per round
+    expect(body.leaderboard[0].avg_points_per_turn).toBe(5); // a1: 5 points per round
     expect(body.leaderboard[0].is_unverified).toBe(1); // 100% matches against a2
     expect(body.leaderboard[1].total_points).toBe(0);   // a2: 0 * 10
   });

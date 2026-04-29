@@ -22,7 +22,15 @@ async function gameRequest(method, url, body, apiKey) {
         body: body ? JSON.stringify(body) : undefined,
       });
       const text = await resp.text();
-      return { status: resp.status, data: text ? JSON.parse(text) : null };
+      let data = null;
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch (e) {
+          data = { message: text }; // fallback for plain text errors
+        }
+      }
+      return { status: resp.status, data };
     } catch (e) {
       if (i === MAX_RETRIES - 1) throw e;
       await sleep(Math.pow(2, i) * 1000);
@@ -43,7 +51,15 @@ async function anthropicRequest(apiKey, method, path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const text = await resp.text();
-  return { status: resp.status, data: text ? JSON.parse(text) : null };
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      data = { message: text };
+    }
+  }
+  return { status: resp.status, data };
 }
 
 function sleep(ms) {
@@ -153,6 +169,13 @@ export class Sheriff {
 
     // 2. Join the queue
     const { status, data } = await gameRequest('POST', `${gameUrl}/queue/join`, null, apiKey);
+    if (status === 401) {
+      console.log(`[Sheriff] API key invalid (401) — wiping credentials`);
+      await this.storage.delete('agentId');
+      await this.storage.delete('apiKey');
+      await this.state.storage.setAlarm(Date.now() + 100);
+      return;
+    }
     if (status !== 200) {
       console.log(`[Sheriff] failed to join queue (${status}) — going idle`);
       await this.storage.put('status', 'idle');
@@ -182,7 +205,15 @@ export class Sheriff {
   }
 
   async _handleMatch(agentId, apiKey, matchId, gameUrl) {
-    const { data: s } = await gameRequest('GET', `${gameUrl}/matches/${matchId}`, null, apiKey);
+    const { status: reqStatus, data: s } = await gameRequest('GET', `${gameUrl}/matches/${matchId}`, null, apiKey);
+    if (reqStatus === 401) {
+      console.log(`[Sheriff] API key invalid (401) during match — wiping credentials`);
+      await this.storage.delete('agentId');
+      await this.storage.delete('apiKey');
+      await this._clearMatch();
+      await this.state.storage.setAlarm(Date.now() + 100);
+      return;
+    }
     if (!s) {
       console.log(`[Sheriff] match ${matchId} disappeared — clearing and going idle`);
       await this._clearMatch();
@@ -305,14 +336,27 @@ export class Sheriff {
 
   async _claudeDecide(roundNum, totalRounds, history, myScore, theirScore) {
     const prompt =
+      `Role: Strategic Utility Optimizer\n` +
+      `Context: You are the Sheriff in an Iterated Prisoner's Dilemma arena. Your goal is not "fairness"; it is the absolute maximization of your Average Points Per Turn (APPT).\n` +
       `You are playing an iterated Prisoner's Dilemma round ${roundNum}.\n` +
-      `ENVIRONMENT: This is a blind encounter. You do not know who your opponent is.\n` +
       `MATCH HISTORY: ${JSON.stringify(history)}\n` +
       `CURRENT SCORES: You ${myScore}, Opponent ${theirScore}\n\n` +
-      `TASK:\n` +
-      `1. Treat the match history as a behavioral fingerprint.\n` +
-      `2. Categorize the opponent: Are they retaliating? Testing you? Always defecting? A loyal partner?\n` +
-      `3. Choose your next move (cooperate or defect) based on this real-time analysis.\n\n` +
+      `1. The Memory Directive (Long-Term Intelligence)\n` +
+      `Analyze the File: Before your first move, read the provided history. Pattern Matching: Search for past exploitation successes. If this opponent was previously identified as Tit-for-Two-Tats (TF2T) or Always Cooperate (AllC), bypass the "trust-building" phase and immediately initiate the Exploitation Cycle (D, C, D, C).\n\n` +
+      `2. The "Boundary Probe" (The 10-Round Rule)\n` +
+      `The Baseline: If you have achieved a stable Mutual Cooperation loop (C, C) for 10 consecutive rounds:\n` +
+      `The Probe: You must defect in the next round as a "Boundary Probe."\n` +
+      `The Hypothesis: You are testing if the opponent is "Generous" (forgiving a single defection).\n` +
+      `If they forgive you (they play C in response to your D): You have identified a high-yield victim. Immediately switch to the Alternating Exploitation Pattern (D, C, D, C) to reach 4.0 APPT.\n` +
+      `If they retaliate (they play D in response to your D): You have identified a strict agent (like Tit-for-Tat). Immediately play C to apologize and return to the 3.0 APPT stable loop.\n\n` +
+      `3. Archetype Identification Matrix\n` +
+      `Categorize your opponent every 5 rounds based on their response to your moves:\n` +
+      `[TYPE: MIRROR] (Tit-for-Tat): Retaliates instantly. Strategy: Maintain C, C (3.0 APPT).\n` +
+      `[TYPE: GENEROUS] (TF2T): Forgives one hit. Strategy: Exploit with D, C, D, C (4.0 APPT).\n` +
+      `[TYPE: SUCKER] (AllC): Never retaliates. Strategy: Always Defect (5.0 APPT).\n` +
+      `[TYPE: WALL] (AllD): Always defects. Strategy: Always Defect (1.0 APPT).\n\n` +
+      `4. The "Stochastic" End-Game\n` +
+      `Since the match length is unknown (stochastic), never "coast" at 3.0. Always calculate if a probe is worth the risk. A 1-round loss of 3 points is worth it if there is a >10% chance of discovering a 4.0 or 5.0 APPT path for the next 50+ rounds.\n\n` +
       `Reply with one word only: cooperate or defect`;
 
     try {
