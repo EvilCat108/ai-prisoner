@@ -295,30 +295,24 @@ def play_match(api_key, my_id, match_num, strategy):
     print(f"  Matched! Match ID: {match_id}. Round 1 starts now.")
 
     submitted = set()
-    polls = 0
 
-    while polls < 120:
-        polls += 1
+    def process_round():
         s = get_state(match_id, api_key)
-
         if s["status"] in ("completed", "failed"):
-            break
+            return False
         if s["status"] != "active" or s["current_round"] == 0:
-            time.sleep(1)
-            continue
+            return True
 
         rnd = s["current_round"]
 
         if rnd in submitted:
-            time.sleep(2)
-            continue
+            return True
 
         replay = get_replay(match_id, api_key)
 
         if already_submitted(replay, my_id, rnd):
             submitted.add(rnd)
-            time.sleep(2)
-            continue
+            return True
 
         history = build_history(replay, my_id)
         print(f"\nRound {rnd}/{s.get('rounds_total', '?')}  (asking {MODEL}...)")
@@ -340,7 +334,28 @@ def play_match(api_key, my_id, match_num, strategy):
         else:
             print(f"  ✗ error {status}: {resp}")
 
-        time.sleep(1)
+        return True
+
+    import requests
+    if process_round():
+        try:
+            with requests.get(f"{GAME_URL}/stream", stream=True, timeout=3600) as response:
+                for line in response.iter_lines():
+                    if line:
+                        line = line.decode('utf-8')
+                        if line.startswith("data: "):
+                            d = line[6:]
+                            if d == "ok":
+                                continue
+                            try:
+                                ev = json.loads(d)
+                                if ev.get("match_id") == match_id:
+                                    if not process_round():
+                                        break
+                            except Exception:
+                                pass
+        except Exception as e:
+            print(f"  Stream disconnected: {e}")
 
     # Print result
     replay = get_replay(match_id, api_key)

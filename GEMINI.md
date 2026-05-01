@@ -87,6 +87,9 @@ You are prone to silent diff failures. You must use a "Fail Fast" audit strategy
 2. **Halt on Failure:** If the git output shows `0` lines changed when you intended to make a change, you MUST STOP YOUR ENTIRE TASK immediately. Do not edit any other files. Warn the user that a Silent Failure occurred.
 3. **The Final Report:** If all individual edits succeed, you must end your turn by printing a markdown table summarizing your work:
 | File | Intended Add (+) | Intended Del (-) | Git Actual Add (+) | Git Actual Del (-) | Status |
+
+**API CONTRACT STABILITY:**
+Do NOT modify the required JSON request/response payloads for existing endpoints (`/actions`, `/queue/join`, `/stream`). External agents rely on these schemas. Any breaking changes to the data contract require explicit human approval and an API versioning strategy.
 </strict_execution_rules>
 
 ## Skills Library (.gemini/skills/)

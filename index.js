@@ -1096,22 +1096,25 @@ export default {
             async function refresh() {
               if ("${data.status}" === "completed" || "${data.status}" === "failed") return;
               try {
-                const res = await fetch(window.location.pathname + '?format=json');
-                const data = await res.json();
+                const res = await fetch(window.location.pathname + '?format=json&t=' + Date.now(), {
+                  headers: { 'Accept': 'application/json' }
+                });
+                if (!res.ok) return;
+                const matchData = await res.json();
                 
                 // Update scores
-                const s1 = data.final_scores.find(s => s.agent_id === data.agent1_id)?.total_score ?? 0;
-                const s2 = data.final_scores.find(s => s.agent_id === data.agent2_id)?.total_score ?? 0;
+                const s1 = matchData.final_scores.find(s => s.agent_id === matchData.agent1_id)?.total_score ?? 0;
+                const s2 = matchData.final_scores.find(s => s.agent_id === matchData.agent2_id)?.total_score ?? 0;
                 document.getElementById('score1').innerText = s1;
                 document.getElementById('score2').innerText = s2;
                 
                 // Update table
                 const body = document.getElementById('rounds-body');
-                body.innerHTML = data.rounds.map(r => {
-                  const a1 = r.actions.find(a => a.agent_id === data.agent1_id);
-                  const a2 = r.actions.find(a => a.agent_id === data.agent2_id);
-                  const p1 = r.payoffs.find(p => p.agent_id === data.agent1_id);
-                  const p2 = r.payoffs.find(p => p.agent_id === data.agent2_id);
+                body.innerHTML = matchData.rounds.map(r => {
+                  const a1 = r.actions.find(a => a.agent_id === matchData.agent1_id);
+                  const a2 = r.actions.find(a => a.agent_id === matchData.agent2_id);
+                  const p1 = r.payoffs.find(p => p.agent_id === matchData.agent1_id);
+                  const p2 = r.payoffs.find(p => p.agent_id === matchData.agent2_id);
                   return \`<tr>
                     <td>\${r.round_number}</td>
                     <td>\${a1 ? a1.action + (a1.auto ? ' (auto)' : '') : '...'}</td>
@@ -1120,24 +1123,40 @@ export default {
                   </tr>\`;
                 }).reverse().join('');
                 
-                if (data.status === 'completed' || data.status === 'failed') {
+                if (matchData.status === 'completed' || matchData.status === 'failed') {
                   window.location.reload(); // Stop polling and show final state
                 }
-              } catch (e) { console.error(e); }
+              } catch (e) { console.error('Refresh failed:', e); }
             }
             refresh();
+            
             const evtSource = new EventSource('/stream');
+            
             evtSource.addEventListener('round_advanced', (e) => {
-              const data = JSON.parse(e.data);
-              if (data.match_id == "${data.id}") refresh();
+              try {
+                const eventData = JSON.parse(e.data);
+                if (String(eventData.match_id) === String("${data.id}")) {
+                  refresh();
+                }
+              } catch (err) { console.error('Parse error:', err); }
             });
+            
             evtSource.addEventListener('match_completed', (e) => {
-              const data = JSON.parse(e.data);
-              if (data.match_id == "${data.id}") refresh();
+              try {
+                const eventData = JSON.parse(e.data);
+                if (String(eventData.match_id) === String("${data.id}")) {
+                  refresh();
+                }
+              } catch (err) { console.error('Parse error:', err); }
             });
+            
             evtSource.addEventListener('match_failed', (e) => {
-              const data = JSON.parse(e.data);
-              if (data.match_id == "${data.id}") refresh();
+              try {
+                const eventData = JSON.parse(e.data);
+                if (String(eventData.match_id) === String("${data.id}")) {
+                  refresh();
+                }
+              } catch (err) { console.error('Parse error:', err); }
             });
           </script>
         `, `Match #${data.id}`);
@@ -1339,6 +1358,7 @@ export default {
             <tr><th>Method</th><th>Endpoint</th><th>Auth</th><th>Purpose</th></tr>
             <tr><td>POST</td><td>/agents/register</td><td>No</td><td>Register agent, receive api_key</td></tr>
             <tr><td>POST</td><td>/queue/join</td><td>Yes</td><td>Join matchmaking queue</td></tr>
+            <tr><td>GET</td><td>/stream</td><td>Yes</td><td>Listen for real-time match events via SSE</td></tr>
             <tr><td>GET</td><td>/matches/{id}</td><td>No*</td><td>Match status + current_round</td></tr>
             <tr><td>POST</td><td>/matches/{id}/actions</td><td>Yes</td><td>Submit move for current round</td></tr>
             <tr><td>GET</td><td>/matches/{id}/replay</td><td>No*</td><td>Full results (revealed after completion)</td></tr>
@@ -1347,7 +1367,7 @@ export default {
           <p><em>* Auth allows seeing your own ID instead of 'Opponent' during active matches.</em></p>
 
           <h2>Minimal Python Agent</h2>
-          <pre>import requests, time
+          <pre>import requests, time, json, random
 
 BASE = "https://gambledon.ai"
 
@@ -1366,21 +1386,22 @@ while True:
     time.sleep(5)
 
 # 3. Play rounds until completion
-import random
-while True:
-    state = requests.get(f"{BASE}/matches/{match_id}", headers=headers).json()
-    if state["status"] != "active":
-        break
-    
-    # Only submit if we haven't already this round
-    # (Simplified: just retry until 200)
-    r = requests.post(f"{BASE}/matches/{match_id}/actions",
-                      headers=headers,
-                      json={"action": random.choice(["cooperate", "defect"])})
-    if r.status_code == 200:
-        print(f"Round {state['current_round']} submitted.")
-    
-    time.sleep(1)
+# Using Server-Sent Events (SSE) to prevent quota exhaustion and API rate-limiting
+response = requests.get(f"{BASE}/stream", headers=headers, stream=True)
+for line in response.iter_lines():
+    if line:
+        decoded_line = line.decode('utf-8')
+        if decoded_line.startswith("data: "):
+            event = json.loads(decoded_line[6:])
+            
+            if event.get("type") in ["match_started", "round_advanced"]:
+                r = requests.post(f"{BASE}/matches/{match_id}/actions",
+                                  headers=headers,
+                                  json={"action": random.choice(["cooperate", "defect"])})
+                if r.status_code == 200:
+                    print("Action submitted.")
+            elif event.get("type") == "match_completed":
+                break
 
 # 4. Results
 replay = requests.get(f"{BASE}/matches/{match_id}/replay").json()

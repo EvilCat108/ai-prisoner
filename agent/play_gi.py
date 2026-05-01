@@ -250,30 +250,24 @@ def play_match(api_key, my_id, match_num):
     print(f"  Matched! Match ID: {match_id}. Round 1 starts now.")
 
     submitted = set()
-    polls = 0
 
-    while polls < 120:
-        polls += 1
+    def process_round():
         s = get_state(match_id, api_key)
-
         if s["status"] in ("completed", "failed"):
-            break
+            return False
         if s["status"] != "active" or s["current_round"] == 0:
-            time.sleep(1)
-            continue
+            return True
 
         rnd = s["current_round"]
 
         if rnd in submitted:
-            time.sleep(2)
-            continue
+            return True
 
         replay = get_replay(match_id, api_key)
 
         if already_submitted(replay, my_id, rnd):
             submitted.add(rnd)
-            time.sleep(2)
-            continue
+            return True
 
         history_data = build_history(replay, my_id)
         print(f"\nRound {rnd}/{s.get('rounds_total', '?')}  (asking {MODEL}...)")
@@ -295,7 +289,35 @@ def play_match(api_key, my_id, match_num):
         else:
             print(f"  ✗ error {status}: {resp}")
 
-        time.sleep(1)
+        return True
+
+    import requests
+    
+    # We wrap the entire listener in a while loop so it auto-reconnects
+    # as long as process_round() says the match is still active.
+    while process_round():
+        try:
+            headers = {"Authorization": f"Bearer {api_key}"}
+            with requests.get(f"{GAME_URL}/stream", headers=headers, stream=True, timeout=3600) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if line:
+                        line = line.decode('utf-8')
+                        if line.startswith("data: "):
+                            d = line[6:]
+                            if d == "ok":
+                                continue
+                            try:
+                                ev = json.loads(d)
+                                # If the event belongs to our match, process the round
+                                if ev.get("match_id") == match_id:
+                                    if not process_round():
+                                        break # Break the for-loop if match is over
+                            except Exception:
+                                pass
+        except requests.exceptions.RequestException as e:
+            # If the stream drops, wait 1 second and loop back to reconnect
+            time.sleep(1)
 
     # Print result
     replay = get_replay(match_id, api_key)
