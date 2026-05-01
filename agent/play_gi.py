@@ -19,7 +19,7 @@ import sys
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-GAME_URL    = "https://gambledonai.com"
+GAME_URL    = "https://gambledon.ai"
 OLLAMA_URL  = "http://localhost:11434"
 MODEL       = "llama3.1:8b"
 _minutes    = int(sys.argv[1]) if len(sys.argv) > 1 else 10

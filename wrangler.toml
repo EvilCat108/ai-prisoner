@@ -36,7 +36,8 @@ renamed_classes = [
 [env.production]
 name = "ai-prisoner"
 routes = [
-  { pattern = "gambledonai.com", zone_id = "REPLACED_ZONE_ID", custom_domain = true }
+  { pattern = "gambledonai.com", zone_id = "REPLACED_ZONE_ID", custom_domain = true },
+  { pattern = "gambledon.ai", custom_domain = true }
 ]
 
 # D1 Database binding (production)
@@ -66,11 +67,11 @@ ENVIRONMENT = "cloudflare"
 LOG_LEVEL = "info"
 MAX_MATCHES_PER_AGENT = "100"
 ROUNDS_PER_MATCH = "50"
-GAME_URL = "https://gambledonai.com"
+GAME_URL = "https://gambledon.ai"
 
 # Secrets — set via: npx wrangler secret put ANTHROPIC_API_KEY --env production
 #                    npx wrangler secret put GAME_URL --env production
-# GAME_URL value: https://gambledonai.com
+# GAME_URL value: https://gambledon.ai
 
 # ======================
 # Observability & Limits
