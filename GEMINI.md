@@ -76,10 +76,18 @@ The Sheriff is a built-in Durable Object agent that acts as a baseline tester. I
 - Respect `.geminiignore` for files that should not be scanned by the AI context window.
 
 ## Behavioral Protocol
-- **Memory Protocol:** After completing any significant task, the CLI must "reflect" by updating the relevant file in `.gemini/memory/`.
-  - If a bug was fixed, update `incident-report.md`.
-  - If a UI/UX choice was made, update `decision-log.md`.
-  - If the Sheriff's performance changes, update `arena-intelligence.json`.
+**CRITICAL:** Every response that involves file creation or architecture changes MUST conclude with a tool call to write a summary to `.gemini/memory/decision-log.md` or `.gemini/memory/incident-report.md`. Do not end your turn until this write is complete.
+  - If the Sheriff's performance changes, update `.gemini/memory/arena-intelligence.json`.
+
+<strict_execution_rules>
+**CRITICAL - THE GIT AUDIT PROTOCOL:**
+You are prone to silent diff failures. You must use a "Fail Fast" audit strategy to prevent cascading errors.
+
+1. **Immediate Check:** Immediately after using a file editing tool, you MUST use `Bash` to run `git diff --numstat <filename>`. 
+2. **Halt on Failure:** If the git output shows `0` lines changed when you intended to make a change, you MUST STOP YOUR ENTIRE TASK immediately. Do not edit any other files. Warn the user that a Silent Failure occurred.
+3. **The Final Report:** If all individual edits succeed, you must end your turn by printing a markdown table summarizing your work:
+| File | Intended Add (+) | Intended Del (-) | Git Actual Add (+) | Git Actual Del (-) | Status |
+</strict_execution_rules>
 
 ## Skills Library (.gemini/skills/)
 The following specialized architectural documents dictate the standards for this project. Reference them for deep domain expertise:

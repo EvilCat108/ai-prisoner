@@ -5,8 +5,6 @@
 const MEMSTORE_ID     = 'memstore_01NoSbc4B9gRz6hqYDv5H6yU';
 const BETA            = 'managed-agents-2026-04-01';
 const MODEL           = 'claude-haiku-4-5-20251001';
-const ALARM_INTERVAL  = 5_000;    // ms between polls (increased frequency)
-const NEXT_MATCH_WAIT = 2_000;    // ms before immediately starting next match
 const MAX_RETRIES     = 3;
 
 // ── HTTP helpers ───────────────────────────────────────────────────────────────
@@ -100,7 +98,6 @@ export class Sheriff {
     }
 
     await this.storage.put('status', 'playing');
-    await this.state.storage.setAlarm(Date.now() + 100);  // fire almost immediately
 
     const agentId = await this.storage.get('agentId');
     const currentMatchId = await this.storage.get('currentMatchId');
@@ -121,18 +118,6 @@ export class Sheriff {
       agentId:        agentId        ?? null,
     });
   }
-
-  // ── Alarm (polling loop) ────────────────────────────────────────────────────
-
-  async alarm() {
-    try {
-      await this._tick();
-    } catch (e) {
-      console.error('[Sheriff] alarm error:', e?.message ?? e);
-      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL);
-    }
-  }
-
   async _tick() {
     let [agentId, apiKey, currentMatchId] = await Promise.all([
       this.storage.get('agentId'),
@@ -150,7 +135,6 @@ export class Sheriff {
       );
       if (status !== 200 && status !== 201) {
         console.log(`[Sheriff] registration failed (${status}) — will retry`);
-        await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL);
         return;
       }
       agentId = data.agent.id;
@@ -173,7 +157,6 @@ export class Sheriff {
       console.log(`[Sheriff] API key invalid (401) — wiping credentials`);
       await this.storage.delete('agentId');
       await this.storage.delete('apiKey');
-      await this.state.storage.setAlarm(Date.now() + 100);
       return;
     }
     if (status !== 200) {
@@ -186,7 +169,6 @@ export class Sheriff {
       console.log(`[Sheriff] queued, checking again soon`);
       await this.storage.put('status', 'idle');
       // Set alarm to check if we are matched soon
-      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL);
       return;
     }
 
@@ -211,7 +193,6 @@ export class Sheriff {
       await this.storage.delete('agentId');
       await this.storage.delete('apiKey');
       await this._clearMatch();
-      await this.state.storage.setAlarm(Date.now() + 100);
       return;
     }
     if (!s) {
@@ -250,7 +231,6 @@ export class Sheriff {
 
     if (submitted.includes(rnd)) {
       // Waiting for opponent to submit
-      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL);
       return;
     }
 
@@ -261,7 +241,6 @@ export class Sheriff {
     if (_alreadySubmitted(replayData, agentId, rnd)) {
       submitted = [...submitted, rnd];
       await this.storage.put('submittedRounds', submitted);
-      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL);
       return;
     }
 
@@ -283,7 +262,6 @@ export class Sheriff {
       console.log(`[Sheriff] submit error ${status} on round ${rnd}`);
     }
 
-    await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL);
   }
 
   async _onMatchComplete(agentId, apiKey, matchId, gameUrl) {

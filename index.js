@@ -1,6 +1,17 @@
 // Cloudflare Workers - AI Prisoner Dilemma Arena
 // Full game implementation backed by D1
 
+const sseClients = new Set();
+
+function broadcastSSE(type, data) {
+  const msg = new TextEncoder().encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+  for (const writer of sseClients) {
+    writer.write(msg).catch(() => {
+      sseClients.delete(writer);
+    });
+  }
+}
+
 function calculatePayoff(myAction, opponentAction) {
   if (myAction === 'cooperate' && opponentAction === 'cooperate') return [3, 3];
   if (myAction === 'cooperate' && opponentAction === 'defect')    return [0, 5];
@@ -58,12 +69,14 @@ async function resolveTimedOutMatch(db, matchId, agent1Id, agent2Id, roundId, ro
   const a1Strike = await checkThreeStrikes(agent1Id);
   const a2Strike = await checkThreeStrikes(agent2Id);
 
+  let nextStateEvent = '';
   if (a1Strike || a2Strike) {
     const failedAgent = a1Strike ? agent1Id : agent2Id;
     const activeAgent = a1Strike ? agent2Id : agent1Id;
     const bothStrike = a1Strike && a2Strike;
 
     ops.push(db.prepare("UPDATE matches SET status = 'failed' WHERE id = ?").bind(matchId));
+    nextStateEvent = 'match_failed';
 
     if (!bothStrike) {
       // Decrease reliability score significantly
@@ -92,15 +105,18 @@ async function resolveTimedOutMatch(db, matchId, agent1Id, agent2Id, roundId, ro
       ops.push(db.prepare("UPDATE matches SET status = 'completed' WHERE id = ?").bind(matchId));
       ops.push(db.prepare("UPDATE agents SET reliability_score = MIN(1.0, reliability_score + 0.01) WHERE id = ?").bind(agent1Id));
       ops.push(db.prepare("UPDATE agents SET reliability_score = MIN(1.0, reliability_score + 0.01) WHERE id = ?").bind(agent2Id));
+      nextStateEvent = 'match_completed';
     } else {
       ops.push(
         db.prepare("INSERT OR IGNORE INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, ?, CURRENT_TIMESTAMP)")
           .bind(matchId, roundNumber + 1)
       );
+      nextStateEvent = 'round_advanced';
     }
   }
 
   await db.batch(ops);
+  broadcastSSE(nextStateEvent, { match_id: matchId, round: nextStateEvent === 'round_advanced' ? roundNumber + 1 : roundNumber });
 }
 
 // Find active rounds whose round_started_at is >= 30 s ago and resolve each.
@@ -570,6 +586,29 @@ export default {
 
     try {
 
+      // ── GET /stream ─────────────────────────────────────────────────────────
+      if (path === '/stream' && method === 'GET') {
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
+        sseClients.add(writer);
+        
+        request.signal.addEventListener('abort', () => {
+          sseClients.delete(writer);
+          writer.close().catch(() => {});
+        });
+
+        // Initial heartbeat
+        writer.write(new TextEncoder().encode("event: connected\ndata: ok\n\n"));
+
+        return new Response(readable, {
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+          }
+        });
+      }
+
       // ── GET / ───────────────────────────────────────────────────────────────
       if (path === '/' && method === 'GET') {
         if (!wantsHtml) return json({ message: 'AI Prisoner Dilemma Arena' });
@@ -746,7 +785,11 @@ export default {
               }
             }
             update();
-            setInterval(update, 3000);
+            const evtSource = new EventSource('/stream');
+            evtSource.addEventListener('match_started', update);
+            evtSource.addEventListener('round_advanced', update);
+            evtSource.addEventListener('match_completed', update);
+            evtSource.addEventListener('match_failed', update);
           </script>
         `, 'The Arena');
       }
@@ -872,10 +915,12 @@ export default {
 
             // Wake up Sheriff if it's involved
             if (agent.id === sheriffId || otherId === sheriffId) {
-              const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
-              const doObj = env.CLAUDE_AGENT.get(doId);
-              ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
+              const doId = env.SHERIFF.idFromName('claude-singleton');
+              const doObj = env.SHERIFF.get(doId);
+              await doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error);
             }
+            
+            broadcastSSE('match_started', { match_id: matchId });
 
             return json({ match_id: matchId, status: 'active' });
           }
@@ -883,9 +928,9 @@ export default {
 
         // Wake up Sheriff so it can check the queue if it was idle (but don't let Sheriff wake itself)
         if (agent.id !== sheriffId) {
-          const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
-          const doObj = env.CLAUDE_AGENT.get(doId);
-          ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
+          const doId = env.SHERIFF.idFromName('claude-singleton');
+          const doObj = env.SHERIFF.get(doId);
+          await doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error);
         }
 
         return json({ message: 'Added to queue', status: 'queued' });
@@ -954,9 +999,9 @@ export default {
           ).bind(matchId, `Round ${round.round_number}`).first();
           if (alreadyResolved) {
             // Wake up DO anyway as a safety net
-            const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
-            const doObj = env.CLAUDE_AGENT.get(doId);
-            ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
+            const doId = env.SHERIFF.idFromName('claude-singleton');
+            const doObj = env.SHERIFF.get(doId);
+            await doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error);
             return new Response(null, { status: 200 });
           }
 
@@ -979,12 +1024,18 @@ export default {
             ops.push(db.prepare('INSERT OR IGNORE INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, ?, CURRENT_TIMESTAMP)').bind(matchId, round.round_number + 1));
           }
           await db.batch(ops);
+          
+          if (shouldTerminate) {
+            broadcastSSE('match_completed', { match_id: matchId });
+          } else {
+            broadcastSSE('round_advanced', { match_id: matchId, round: round.round_number + 1 });
+          }
         }
         
         // Wake up the Claude agent so it plays its turn without waiting 30s
-        const doId = env.CLAUDE_AGENT.idFromName('claude-singleton');
-        const doObj = env.CLAUDE_AGENT.get(doId);
-        ctx.waitUntil(doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error));
+        const doId = env.SHERIFF.idFromName('claude-singleton');
+        const doObj = env.SHERIFF.get(doId);
+        await doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error);
 
         return new Response(null, { status: 200 });
       }
@@ -1074,7 +1125,20 @@ export default {
                 }
               } catch (e) { console.error(e); }
             }
-            setInterval(refresh, 3000);
+            refresh();
+            const evtSource = new EventSource('/stream');
+            evtSource.addEventListener('round_advanced', (e) => {
+              const data = JSON.parse(e.data);
+              if (data.match_id == "${data.id}") refresh();
+            });
+            evtSource.addEventListener('match_completed', (e) => {
+              const data = JSON.parse(e.data);
+              if (data.match_id == "${data.id}") refresh();
+            });
+            evtSource.addEventListener('match_failed', (e) => {
+              const data = JSON.parse(e.data);
+              if (data.match_id == "${data.id}") refresh();
+            });
           </script>
         `, `Match #${data.id}`);
       }
@@ -1342,15 +1406,15 @@ for s in replay["final_scores"]:
 
       // ── POST /agent/wake ────────────────────────────────────────────────────
       if (path === '/agent/wake' && method === 'POST') {
-        const id  = env.CLAUDE_AGENT.idFromName('claude-singleton');
-        const obj = env.CLAUDE_AGENT.get(id);
+        const id  = env.SHERIFF.idFromName('claude-singleton');
+        const obj = env.SHERIFF.get(id);
         return obj.fetch(new Request('http://do/wake', { method: 'POST' }));
       }
 
       // ── GET /agent/status ───────────────────────────────────────────────────
       if (path === '/agent/status' && method === 'GET') {
-        const id  = env.CLAUDE_AGENT.idFromName('claude-singleton');
-        const obj = env.CLAUDE_AGENT.get(id);
+        const id  = env.SHERIFF.idFromName('claude-singleton');
+        const obj = env.SHERIFF.get(id);
         return obj.fetch(new Request('http://do/status', { method: 'GET' }));
       }
 
@@ -1411,7 +1475,11 @@ for s in replay["final_scores"]:
               }
             }
             update();
-            setInterval(update, 3000);
+            const evtSource = new EventSource('/stream');
+            evtSource.addEventListener('match_started', update);
+            evtSource.addEventListener('round_advanced', update);
+            evtSource.addEventListener('match_completed', update);
+            evtSource.addEventListener('match_failed', update);
           </script>
         `, 'Live Matches');
       }

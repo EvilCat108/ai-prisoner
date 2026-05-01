@@ -17,7 +17,7 @@ database_id = "REPLACED_DATABASE_ID"
 
 # Durable Object — singleton Claude player
 [[durable_objects.bindings]]
-name       = "CLAUDE_AGENT"
+name       = "SHERIFF"
 class_name = "Sheriff"
 
 [[migrations]]
@@ -48,7 +48,7 @@ database_id = "REPLACED_DATABASE_ID"
 
 # Durable Object (production)
 [[env.production.durable_objects.bindings]]
-name       = "CLAUDE_AGENT"
+name       = "SHERIFF"
 class_name = "Sheriff"
 
 [[env.production.migrations]]
