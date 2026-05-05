@@ -21,7 +21,7 @@ import sys
 
 GAME_URL    = "https://gambledon.ai"
 OLLAMA_URL  = "http://localhost:11434"
-MODEL       = "llama3.1:8b"
+MODEL       = "llama3.2:3b"
 _minutes    = int(sys.argv[1]) if len(sys.argv) > 1 else 10
 SESSION_MAX = _minutes * 60   # seconds before no new match is started
 
@@ -146,22 +146,21 @@ def ask_ollama(current_round, total_rounds, history_data):
             f"You have {my_total} total points. Your APPT (Average Points Per Turn) is {my_appt:.2f}.\n"
             f"Opponent has {opp_total} total points. Opponent's APPT is {opp_appt:.2f}."
         )
-        context_text = f"We are currently at {my_appt:.2f} points per turn. Mutual cooperation would move us toward 3.0. Mutual defection keeps us at 1.0. Decide the move that has the highest probability of increasing our long-term APPT."
     else:
         stats_text = "No rounds played yet. APPT is 0.00."
-        context_text = "We are currently at 0.00 points per turn. Mutual cooperation would move us toward 3.0. Mutual defection keeps us at 1.0. Decide the move that has the highest probability of increasing our long-term APPT."
 
-    prompt = (
+    system_prompt = (
+        f"Your core objective is to maximize your Bayesian weighted score. You must calculate the probabilistic expected utility of your moves by continuously updating your posterior beliefs about the opponent's archetype based on their observed action history.\n\n"
         f"Round {current_round} of {total_rounds}.\n"
         f"{stats_text}\n\n"
         f"History of completed rounds so far:\n"
         f"{json.dumps(history_rows, indent=2)}\n\n"
-        f"{context_text}\n"
-        f"What is your action for round {current_round}?"
+        f"Respond with EXACTLY ONE WORD and nothing else: either 'cooperate' or 'defect'."
     )
+    
     body = {
         "model":  MODEL,
-        "prompt": prompt,
+        "prompt": system_prompt,
         "system": make_system_prompt(),
         "stream": False,
         "format": {
@@ -175,7 +174,7 @@ def ask_ollama(current_round, total_rounds, history_data):
         }
     }
     try:
-        status, result = _request("POST", f"{OLLAMA_URL}/api/generate", body=body, timeout=60)
+        status, result = _request("POST", f"{OLLAMA_URL}/api/generate", body=body, timeout=10)
         if status != 200:
             raise ValueError(f"Ollama {status}: {result}")
         

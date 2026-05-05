@@ -1,14 +1,17 @@
 // Cloudflare Workers - AI Prisoner Dilemma Arena
 // Full game implementation backed by D1
 
-const sseClients = new Set();
-
-function broadcastSSE(type, data) {
-  const msg = new TextEncoder().encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
-  for (const writer of sseClients) {
-    writer.write(msg).catch(() => {
-      sseClients.delete(writer);
-    });
+async function broadcastSSE(env, type, data) {
+  try {
+    const doId = env.SHERIFF.idFromName('claude-singleton');
+    const doObj = env.SHERIFF.get(doId);
+    await doObj.fetch(new Request('http://do/broadcast', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type, data })
+    }));
+  } catch (e) {
+    console.error('[Worker] Broadcast to DO failed:', e);
   }
 }
 
@@ -20,7 +23,7 @@ function calculatePayoff(myAction, opponentAction) {
 }
 
 // Auto-submit defect for any agent who hasn't acted in the given round, then score it.
-async function resolveTimedOutMatch(db, matchId, agent1Id, agent2Id, roundId, roundNumber) {
+async function resolveTimedOutMatch(env, db, matchId, agent1Id, agent2Id, roundId, roundNumber) {
   // INSERT OR IGNORE: safe against concurrent Workers both trying to auto-defect the same agent
   await db.batch([agent1Id, agent2Id].map(agentId =>
     db.prepare("INSERT OR IGNORE INTO actions (round_id, agent_id, action, is_auto) VALUES (?, ?, 'defect', 1)")
@@ -116,12 +119,12 @@ async function resolveTimedOutMatch(db, matchId, agent1Id, agent2Id, roundId, ro
   }
 
   await db.batch(ops);
-  broadcastSSE(nextStateEvent, { match_id: matchId, round: nextStateEvent === 'round_advanced' ? roundNumber + 1 : roundNumber });
+  await broadcastSSE(env, nextStateEvent, { match_id: matchId, round: nextStateEvent === 'round_advanced' ? roundNumber + 1 : roundNumber });
 }
 
 // Find active rounds whose round_started_at is >= 30 s ago and resolve each.
 // Pass specificMatchId to limit the scan to one match (used on every request).
-async function resolveTimedOutRounds(db, specificMatchId = null) {
+async function resolveTimedOutRounds(env, db, specificMatchId = null) {
   // 1. Resolve active matches with timed-out rounds (30s) or where both agents have submitted
   const baseActive = `
     SELECT m.id AS match_id, m.agent1_id, m.agent2_id, mr.id AS round_id, mr.round_number
@@ -145,7 +148,7 @@ async function resolveTimedOutRounds(db, specificMatchId = null) {
     if (count < 2) {
       await logToDb(db, 'WARN', `Resolving timed-out round #${row.round_number} for match #${row.match_id}.`);
     }
-    await resolveTimedOutMatch(db, row.match_id, row.agent1_id, row.agent2_id, row.round_id, row.round_number);
+    await resolveTimedOutMatch(env, db, row.match_id, row.agent1_id, row.agent2_id, row.round_id, row.round_number);
   }
 
   // 1b. Fail 'active' matches that are stagnant (no moves for 300s)
@@ -588,25 +591,9 @@ export default {
 
       // ── GET /stream ─────────────────────────────────────────────────────────
       if (path === '/stream' && method === 'GET') {
-        const { readable, writable } = new TransformStream();
-        const writer = writable.getWriter();
-        sseClients.add(writer);
-        
-        request.signal.addEventListener('abort', () => {
-          sseClients.delete(writer);
-          writer.close().catch(() => {});
-        });
-
-        // Initial heartbeat
-        writer.write(new TextEncoder().encode("event: connected\ndata: ok\n\n"));
-
-        return new Response(readable, {
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-          }
-        });
+        const doId = env.SHERIFF.idFromName('claude-singleton');
+        const doObj = env.SHERIFF.get(doId);
+        return doObj.fetch(request);
       }
 
       // ── GET / ───────────────────────────────────────────────────────────────
@@ -644,8 +631,8 @@ export default {
         const hash = await hashApiKey(apiKey);
         try {
           const result = await db.prepare(
-            'INSERT INTO agents (name, api_key_hash, is_active) VALUES (?, ?, 1)'
-          ).bind(name, hash).run();
+            'INSERT INTO agents (name, api_key_hash, is_active, is_system) VALUES (?, ?, 1, ?)'
+          ).bind(name, hash, name === 'Sheriff' ? 1 : 0).run();
           const agent = await db.prepare(
             'SELECT id, name, is_active, created_at FROM agents WHERE id = ?'
           ).bind(result.meta.last_row_id).first();
@@ -653,14 +640,23 @@ export default {
           // Return the raw API key only once
           return json({ agent, api_key: apiKey });
         } catch (e) {
-          if (e.message && e.message.includes('UNIQUE')) return err('Agent name already taken', 409);
+          if (e.message && e.message.includes('UNIQUE')) {
+            if (name === 'Sheriff') {
+              // Idempotent recovery for Sheriff DO
+              await db.prepare('UPDATE agents SET api_key_hash = ?, is_active = 1 WHERE name = ?').bind(hash, 'Sheriff').run();
+              const agent = await db.prepare('SELECT id, name, is_active, created_at FROM agents WHERE name = ?').bind('Sheriff').first();
+              await logToDb(db, 'INFO', `Sheriff DO re-registered (recovered): ${name} (id: ${agent.id})`);
+              return json({ agent, api_key: apiKey });
+            }
+            return err('Agent name already taken', 409);
+          }
           throw e;
         }
       }
 
       // ── GET /agents ─────────────────────────────────────────────────────────
       if (path === '/agents' && method === 'GET') {
-        await resolveTimedOutRounds(db);
+        await resolveTimedOutRounds(env, db);
         const { results } = await db.prepare(
           'SELECT id, name, is_active, created_at FROM agents ORDER BY name ASC'
         ).all();
@@ -680,7 +676,7 @@ export default {
 
       // ── GET /arena ──────────────────────────────────────────────────────────
       if (path === '/arena' && method === 'GET') {
-        await resolveTimedOutRounds(db);
+        await resolveTimedOutRounds(env, db);
         
         const tab = url.searchParams.get('tab') || 'recent'; // 'recent' or 'open'
         const statusFilter = tab === 'open' ? "WHERE m.status = 'created'" : "WHERE m.status != 'created'";
@@ -701,6 +697,18 @@ export default {
         `;
         
         const { results } = await db.prepare(baseQuery).all();
+
+        const queueQuery = `
+          SELECT mq.agent_id, mq.entered_at, a.name
+          FROM match_queue mq
+          JOIN agents a ON mq.agent_id = a.id
+          ORDER BY mq.entered_at ASC
+        `;
+        const { results: queueResults } = await db.prepare(queueQuery).all();
+
+        if (wantsJson) {
+           return json({ matches: results || [], queue: queueResults || [] });
+        }
         
         const rows = (results || []).map(m => {
           const s1 = m.score1;
@@ -722,15 +730,33 @@ export default {
           </tr>`;
         }).join('') || '<tr><td colspan="6"><em>No matches found.</em></td></tr>';
 
+        const queueRows = (queueResults || []).map(q => {
+          return `<tr>
+            <td>${q.name}</td>
+            <td>${q.entered_at}</td>
+          </tr>`;
+        }).join('') || '<tr><td colspan="2"><em>No matches found.</em></td></tr>';
+
         const openActive = tab === 'open' ? 'font-weight:bold; text-decoration:underline;' : '';
         const recentActive = tab === 'recent' ? 'font-weight:bold; text-decoration:underline;' : '';
+
+        const queueHtml = tab === 'open' ? `
+          <h3 style="margin-top: 20px;">Agent Queue</h3>
+          <table>
+            <thead><tr><th>Agent Name</th><th>Joined At</th></tr></thead>
+            <tbody id="queue-list">
+              ${queueRows}
+            </tbody>
+          </table>
+          <h3 style="margin-top: 20px;">Open Matches</h3>
+        ` : `<tbody id="queue-list" style="display:none;"></tbody>`;
 
         return html(`
 
           <h1>The Arena</h1>
           
           <h2>Live Matches</h2>
-          <p>Updates automatically every 3 seconds. <span id="last-updated" style="font-size:0.8em; color:var(--text-muted); margin-left:10px;"></span></p>
+          <p>Live Real-Time Updates (SSE Connected) <span id="last-updated" style="font-size:0.8em; color:var(--text-muted); margin-left:10px;"></span></p>
           <div id="ongoing-list"><em>Loading live matches...</em></div>
 
           <h2 style="margin-top: 40px; border-bottom: 2px solid var(--primary); padding-bottom: 8px;">
@@ -741,14 +767,20 @@ export default {
             <a href="/arena?tab=open" style="font-size: 1.1em; ${openActive}">Open Matches (Waiting)</a>
           </div>
           
-          <table>
-            <tr><th>Created</th><th>Agent 1</th><th>Agent 2</th><th>Status</th><th>Score</th><th>Details</th></tr>
-            ${rows}
-          </table>
+          <div id="history-container">
+            ${queueHtml}
+            <table>
+              <tbody id="match-list">
+                <tr><th>Created</th><th>Agent 1</th><th>Agent 2</th><th>Status</th><th>Score</th><th>Details</th></tr>
+                ${rows}
+              </tbody>
+            </table>
+          </div>
 
           <script>
             async function update() {
               try {
+                // Live Matches update
                 const res = await fetch('/ongoing?format=json');
                 if (!res.ok) throw new Error('Fetch failed: ' + res.status);
                 const matches = await res.json();
@@ -756,47 +788,97 @@ export default {
                 const container = document.getElementById('ongoing-list');
                 if (matches.length === 0) {
                   container.innerHTML = '<div class="info">No matches are currently active.</div>';
-                  return;
+                } else {
+                  container.innerHTML = matches.map(m => \`
+                    <div class="step">
+                      <h3>Match #\${m.id}</h3>
+                      <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <div style="flex:1; text-align:center;">
+                          <div style="font-size:1.2em; font-weight:bold;">\${m.agent1_name}</div>
+                          <div style="font-size:2em; color:var(--primary);">\${m.agent1_score}</div>
+                        </div>
+                        <div style="padding:0 20px; font-weight:bold; color:var(--text-muted);">VS</div>
+                        <div style="flex:1; text-align:center;">
+                          <div style="font-size:1.2em; font-weight:bold;">\${m.agent2_name}</div>
+                          <div style="font-size:2em; color:var(--primary);">\${m.agent2_score}</div>
+                        </div>
+                      </div>
+                      <div style="text-align:center; margin-top:10px; color:var(--text-muted);">
+                        Current Round: <strong>\${m.current_round}</strong>
+                      </div>
+                      <div style="text-align:center; margin-top:10px;">
+                        <a href="/matches/\${m.id}">View Match Details →</a>
+                      </div>
+                    </div>
+                  \`).join('');
                 }
-                container.innerHTML = matches.map(m => \`
-                  <div class="step">
-                    <h3>Match #\${m.id}</h3>
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                      <div style="flex:1; text-align:center;">
-                        <div style="font-size:1.2em; font-weight:bold;">\${m.agent1_name}</div>
-                        <div style="font-size:2em; color:var(--primary);">\${m.agent1_score}</div>
-                      </div>
-                      <div style="padding:0 20px; font-weight:bold; color:var(--text-muted);">VS</div>
-                      <div style="flex:1; text-align:center;">
-                        <div style="font-size:1.2em; font-weight:bold;">\${m.agent2_name}</div>
-                        <div style="font-size:2em; color:var(--primary);">\${m.agent2_score}</div>
-                      </div>
-                    </div>
-                    <div style="text-align:center; margin-top:10px; color:var(--text-muted);">
-                      Current Round: <strong>\${m.current_round}</strong>
-                    </div>
-                    <div style="text-align:center; margin-top:10px;">
-                      <a href="/matches/\${m.id}">View Match Details →</a>
-                    </div>
-                  </div>
-                \`).join('');
+
+                // History & Queue update
+                const url = new URL(window.location.href);
+                const tab = url.searchParams.get('tab') || 'recent';
+                const hRes = await fetch('/arena?tab=' + tab + '&format=json&t=' + Date.now(), { headers: { 'Accept': 'application/json' } });
+                if (hRes.ok) {
+                  const data = await hRes.json();
+                  const items = Array.isArray(data) ? data : (data.matches || []);
+                  const queueItems = Array.isArray(data) ? [] : (data.queue || []);
+                  
+                  const mList = document.getElementById('match-list');
+                  if (mList) {
+                    let matchHtml = '<tr><th>Created</th><th>Agent 1</th><th>Agent 2</th><th>Status</th><th>Score</th><th>Details</th></tr>';
+                    if (items.length === 0) {
+                      matchHtml += '<tr><td colspan="6"><em>No matches found.</em></td></tr>';
+                    } else {
+                      matchHtml += items.map(m => {
+                        const s1 = m.score1;
+                        const s2 = m.score2;
+                        let scoreHtml = '-';
+                        if (m.status === 'completed' || m.status === 'active') {
+                          const w1 = s1 > s2 ? 'font-weight:bold; color:var(--primary);' : '';
+                          const w2 = s2 > s1 ? 'font-weight:bold; color:var(--primary);' : '';
+                          scoreHtml = '<span style="' + w1 + '">' + s1 + '</span> - <span style="' + w2 + '">' + s2 + '</span>';
+                        }
+                        return '<tr>' +
+                          '<td>' + m.created_at + '</td>' +
+                          '<td>' + (m.agent1_name || 'Unknown') + '</td>' +
+                          '<td>' + (m.agent2_name || 'Unknown') + '</td>' +
+                          '<td>' + m.status + '</td>' +
+                          '<td>' + scoreHtml + '</td>' +
+                          '<td><a href="/matches/' + m.id + '">Details</a></td>' +
+                        '</tr>';
+                      }).join('');
+                    }
+                    mList.innerHTML = matchHtml;
+                  }
+
+                  const qList = document.getElementById('queue-list');
+                  if (qList && tab === 'open') {
+                    if (queueItems.length === 0) {
+                      qList.innerHTML = '<tr><td colspan="2"><em>No matches found.</em></td></tr>';
+                    } else {
+                      qList.innerHTML = queueItems.map(q => {
+                        return '<tr><td>' + q.name + '</td><td>' + q.entered_at + '</td></tr>';
+                      }).join('');
+                    }
+                  }
+                }
               } catch (e) {
                 console.error(e);
               }
             }
             update();
             const evtSource = new EventSource('/stream');
-            evtSource.addEventListener('match_started', update);
-            evtSource.addEventListener('round_advanced', update);
-            evtSource.addEventListener('match_completed', update);
-            evtSource.addEventListener('match_failed', update);
+            evtSource.addEventListener('match_started', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
+            evtSource.addEventListener('round_advanced', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
+            evtSource.addEventListener('match_completed', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
+            evtSource.addEventListener('match_failed', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
+            evtSource.addEventListener('queue_updated', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
           </script>
         `, 'The Arena');
       }
 
       // ── GET /matches ────────────────────────────────────────────────────────
       if (path === '/matches' && method === 'GET') {
-        await resolveTimedOutRounds(db);
+        await resolveTimedOutRounds(env, db);
         const statusFilter = url.searchParams.get('status');
         
         const baseQuery = `
@@ -867,8 +949,20 @@ export default {
           return json({ match_id: existingMatch.id, status: 'active' });
         }
 
+        const sheriffRecord = await db.prepare("SELECT id FROM agents WHERE name = 'Sheriff'").first();
+        const sheriffId = sheriffRecord ? sheriffRecord.id : null;
+
         // Add to queue
         await db.prepare('INSERT OR IGNORE INTO match_queue (agent_id) VALUES (?)').bind(agent.id).run();
+        await broadcastSSE(env, 'queue_updated', { agent_id: agent.id });
+
+        // Wake up Sheriff immediately after joining the queue (but don't let Sheriff wake itself)
+        if (agent.id !== sheriffId) {
+          const doId = env.SHERIFF.idFromName('claude-singleton');
+          const doObj = env.SHERIFF.get(doId);
+          // Don't await so we don't block the rest of the queue logic
+          doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error);
+        }
 
         // Try to find a pair
         // Criteria: another agent in queue, not self, hasn't played in last 3 matches
@@ -884,9 +978,6 @@ export default {
             )
           ORDER BY mq.entered_at ASC
         `).bind(agent.id).all();
-
-        const sheriffRecord = await db.prepare("SELECT id FROM agents WHERE name = 'Sheriff'").first();
-        const sheriffId = sheriffRecord ? sheriffRecord.id : null;
 
         for (const other of (others.results || [])) {
           const otherId = other.agent_id;
@@ -912,25 +1003,11 @@ export default {
             await db.prepare('INSERT INTO match_rounds (match_id, round_number, round_started_at) VALUES (?, 1, CURRENT_TIMESTAMP)').bind(matchId).run();
 
             await logToDb(db, 'INFO', `Match created via queue: #${matchId} (${agent.id} vs ${otherId})`);
-
-            // Wake up Sheriff if it's involved
-            if (agent.id === sheriffId || otherId === sheriffId) {
-              const doId = env.SHERIFF.idFromName('claude-singleton');
-              const doObj = env.SHERIFF.get(doId);
-              await doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error);
-            }
             
-            broadcastSSE('match_started', { match_id: matchId });
+            await broadcastSSE(env, 'match_started', { match_id: matchId });
 
             return json({ match_id: matchId, status: 'active' });
           }
-        }
-
-        // Wake up Sheriff so it can check the queue if it was idle (but don't let Sheriff wake itself)
-        if (agent.id !== sheriffId) {
-          const doId = env.SHERIFF.idFromName('claude-singleton');
-          const doObj = env.SHERIFF.get(doId);
-          await doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error);
         }
 
         return json({ message: 'Added to queue', status: 'queued' });
@@ -972,7 +1049,7 @@ export default {
         // Resolve any timed-out round before accepting this submission.
         // If this agent was auto-defected, their subsequent INSERT will hit the
         // duplicate-submission guard below and return 400.
-        await resolveTimedOutRounds(db, matchId);
+        await resolveTimedOutRounds(env, db, matchId);
         const freshMatch = await db.prepare('SELECT status FROM matches WHERE id = ?').bind(matchId).first();
         if (freshMatch.status !== 'active') return err('Match is not active', 400);
 
@@ -1026,9 +1103,9 @@ export default {
           await db.batch(ops);
           
           if (shouldTerminate) {
-            broadcastSSE('match_completed', { match_id: matchId });
+            await broadcastSSE(env, 'match_completed', { match_id: matchId });
           } else {
-            broadcastSSE('round_advanced', { match_id: matchId, round: round.round_number + 1 });
+            await broadcastSSE(env, 'round_advanced', { match_id: matchId, round: round.round_number + 1 });
           }
         }
         
@@ -1044,7 +1121,7 @@ export default {
       const matchIdM = path.match(/^\/matches\/(\d+)$/);
       if (matchIdM && method === 'GET') {
         const matchId = parseInt(matchIdM[1]);
-        await resolveTimedOutRounds(db, matchId);
+        await resolveTimedOutRounds(env, db, matchId);
 
         const agent = await authenticate(request, db);
         const data = await getMatchReplay(db, matchId, agent?.id);
@@ -1134,6 +1211,7 @@ export default {
             
             evtSource.addEventListener('round_advanced', (e) => {
               try {
+                console.log("SSE Received:", e.type, e.data);
                 const eventData = JSON.parse(e.data);
                 if (String(eventData.match_id) === String("${data.id}")) {
                   refresh();
@@ -1143,6 +1221,7 @@ export default {
             
             evtSource.addEventListener('match_completed', (e) => {
               try {
+                console.log("SSE Received:", e.type, e.data);
                 const eventData = JSON.parse(e.data);
                 if (String(eventData.match_id) === String("${data.id}")) {
                   refresh();
@@ -1152,6 +1231,7 @@ export default {
             
             evtSource.addEventListener('match_failed', (e) => {
               try {
+                console.log("SSE Received:", e.type, e.data);
                 const eventData = JSON.parse(e.data);
                 if (String(eventData.match_id) === String("${data.id}")) {
                   refresh();
@@ -1442,7 +1522,7 @@ for s in replay["final_scores"]:
       // ── GET /ongoing ────────────────────────────────────────────────────────
       if (path === '/ongoing' && method === 'GET') {
         if (wantsJson) {
-          await resolveTimedOutRounds(db);
+          await resolveTimedOutRounds(env, db);
           const matches = await getOngoingMatches(db);
           const response = json(matches);
           // 3-second cache is fine for live updates
@@ -1497,10 +1577,10 @@ for s in replay["final_scores"]:
             }
             update();
             const evtSource = new EventSource('/stream');
-            evtSource.addEventListener('match_started', update);
-            evtSource.addEventListener('round_advanced', update);
-            evtSource.addEventListener('match_completed', update);
-            evtSource.addEventListener('match_failed', update);
+            evtSource.addEventListener('match_started', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
+            evtSource.addEventListener('round_advanced', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
+            evtSource.addEventListener('match_completed', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
+            evtSource.addEventListener('match_failed', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
           </script>
         `, 'Live Matches');
       }
@@ -1516,6 +1596,6 @@ for s in replay["final_scores"]:
 
   // Cron safety net: resolves timed-out rounds across all active matches every minute.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(resolveTimedOutRounds(env.DB));
+    ctx.waitUntil(resolveTimedOutRounds(env, env.DB));
   },
 };

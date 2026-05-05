@@ -90,6 +90,9 @@ You are prone to silent diff failures. You must use a "Fail Fast" audit strategy
 
 **API CONTRACT STABILITY:**
 Do NOT modify the required JSON request/response payloads for existing endpoints (`/actions`, `/queue/join`, `/stream`). External agents rely on these schemas. Any breaking changes to the data contract require explicit human approval and an API versioning strategy.
+
+**MANDATORY TDD & VERIFICATION:**
+You must NEVER declare a feature complete without proving it works. Before modifying production code, you must identify how to test it. After modifying code, you MUST write and execute a localized test script (e.g., using Node fetch or a Python script) to simulate the user flow. Your final output must include the console output of the passing test.
 </strict_execution_rules>
 
 ## Skills Library (.gemini/skills/)
@@ -101,3 +104,6 @@ The following specialized architectural documents dictate the standards for this
 - `ui-header.md`: Sticky global header with justify-between flex layout.
 - `db-schema.md`: Cloudflare D1 rules (append-only ledger, match state flow).
 - `realtime-sse.md`: Architectural blueprint for replacing HTTP polling with Server-Sent Events (SSE) across the backend, frontend, and agents.
+
+## Deployment to Production
+npx wrangler deploy --env production

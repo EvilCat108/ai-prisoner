@@ -71,6 +71,7 @@ export class Sheriff {
     this.state   = state;
     this.env     = env;
     this.storage = state.storage;
+    this.sessions = new Set();
   }
 
   // ── Fetch handler (called from Worker routing) ──────────────────────────────
@@ -78,6 +79,14 @@ export class Sheriff {
   async fetch(request) {
     const { pathname } = new URL(request.url);
 
+    if (pathname === '/stream' && request.method === 'GET') {
+      return this._handleStream(request);
+    }
+    if (pathname === '/broadcast' && request.method === 'POST') {
+      const body = await request.json();
+      await this.broadcast(body.type, body.data);
+      return new Response('ok');
+    }
     if (pathname === '/wake' && request.method === 'POST') {
       return this._handleWake();
     }
@@ -85,6 +94,50 @@ export class Sheriff {
       return this._handleStatus();
     }
     return new Response('not found', { status: 404 });
+  }
+
+  // ── SSE Broadcaster ─────────────────────────────────────────────────────────
+
+  async _handleStream(request) {
+    let clientController;
+    const readable = new ReadableStream({
+      start: (controller) => {
+        clientController = controller;
+        this.sessions.add(controller);
+        controller.enqueue(new TextEncoder().encode("event: connected\ndata: ok\n\n"));
+      },
+      cancel: () => {
+        if (clientController) this.sessions.delete(clientController);
+      }
+    });
+
+    request.signal.addEventListener('abort', () => {
+      if (clientController) this.sessions.delete(clientController);
+    });
+
+    return new Response(readable, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      }
+    });
+  }
+
+  async broadcast(type, data) {
+    const msg = new TextEncoder().encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+    for (const controller of this.sessions) {
+      try {
+        controller.enqueue(msg);
+      } catch (e) {
+        this.sessions.delete(controller);
+      }
+    }
+  }
+
+  async alarm() {
+    console.log('[Sheriff] alarm triggered');
+    await this._tick();
   }
 
   async _handleWake() {
@@ -147,8 +200,11 @@ export class Sheriff {
     }
 
     if (currentMatchId) {
-      await this._handleMatch(agentId, apiKey, currentMatchId, gameUrl);
-      return;
+      const matchStillActive = await this._handleMatch(agentId, apiKey, currentMatchId, gameUrl);
+      if (matchStillActive) return;
+      // Match was cleared, proceed to join queue
+      apiKey = await this.storage.get('apiKey'); // Refresh in case it was wiped
+      if (!apiKey) return;
     }
 
     // 2. Join the queue
@@ -166,9 +222,9 @@ export class Sheriff {
     }
 
     if (data.status === 'queued') {
-      console.log(`[Sheriff] queued, checking again soon`);
+      console.log(`[Sheriff] queued, checking again in 10s`);
       await this.storage.put('status', 'idle');
-      // Set alarm to check if we are matched soon
+      await this.storage.setAlarm(Date.now() + 10000);
       return;
     }
 
@@ -184,6 +240,8 @@ export class Sheriff {
     }
 
     await this.storage.put('status', 'idle');
+    // Set a safety alarm to check for queue again in 1 minute if we are completely idle
+    await this.storage.setAlarm(Date.now() + 60000);
   }
 
   async _handleMatch(agentId, apiKey, matchId, gameUrl) {
@@ -193,37 +251,37 @@ export class Sheriff {
       await this.storage.delete('agentId');
       await this.storage.delete('apiKey');
       await this._clearMatch();
-      return;
+      return false;
     }
-    if (!s) {
+    if (reqStatus === 404 || !s) {
       console.log(`[Sheriff] match ${matchId} disappeared — clearing and going idle`);
       await this._clearMatch();
       await this.storage.put('status', 'idle');
-      return;
+      return false;
     }
 
     if (s.status === 'completed') {
       await this._onMatchComplete(agentId, apiKey, matchId, gameUrl);
-      return;
+      return false;
     }
 
     if (s.status === 'failed') {
       console.log(`[Sheriff] match ${matchId} failed — clearing and going idle`);
       await this._clearMatch();
       await this.storage.put('status', 'idle');
-      return;
+      return false;
     }
 
     if (s.status === 'created') {
       // Still waiting for a second player to join
       console.log(`[Sheriff] match ${matchId} waiting for opponent — going idle`);
       await this.storage.put('status', 'idle');
-      return;
+      return true;
     }
 
     if (s.status !== 'active' || !s.current_round) {
       await this.storage.put('status', 'idle');
-      return;
+      return true;
     }
 
     const rnd = s.current_round;
@@ -231,7 +289,9 @@ export class Sheriff {
 
     if (submitted.includes(rnd)) {
       // Waiting for opponent to submit
-      return;
+      console.log(`[Sheriff] Round ${rnd} already submitted, waiting for opponent...`);
+      await this.storage.setAlarm(Date.now() + 15000);
+      return true;
     }
 
     // Fetch replay to check if already submitted server-side
@@ -262,6 +322,7 @@ export class Sheriff {
       console.log(`[Sheriff] submit error ${status} on round ${rnd}`);
     }
 
+    return true;
   }
 
   async _onMatchComplete(agentId, apiKey, matchId, gameUrl) {
@@ -295,6 +356,7 @@ export class Sheriff {
     await this._clearMatch();
     await this.storage.put('status', 'idle');
     // No setAlarm here, wait for the next manual wake or server trigger
+    return false;
   }
 
   async _clearMatch() {
@@ -315,7 +377,7 @@ export class Sheriff {
   async _claudeDecide(roundNum, totalRounds, history, myScore, theirScore) {
     const prompt =
       `Role: Strategic Utility Optimizer\n` +
-      `Context: You are the Sheriff in an Iterated Prisoner's Dilemma arena. Your goal is not "fairness"; it is the absolute maximization of your Average Points Per Turn (APPT).\n` +
+      `Context: You are the Sheriff in an Iterated Prisoner's Dilemma arena. Your core objective is to maximize your Bayesian weighted score. You must calculate the probabilistic expected utility of your moves by continuously updating your posterior beliefs about the opponent's archetype based on their observed action history.\n` +
       `You are playing an iterated Prisoner's Dilemma round ${roundNum}.\n` +
       `MATCH HISTORY: ${JSON.stringify(history)}\n` +
       `CURRENT SCORES: You ${myScore}, Opponent ${theirScore}\n\n` +
@@ -328,7 +390,7 @@ export class Sheriff {
       `If they forgive you (they play C in response to your D): You have identified a high-yield victim. Immediately switch to the Alternating Exploitation Pattern (D, C, D, C) to reach 4.0 APPT.\n` +
       `If they retaliate (they play D in response to your D): You have identified a strict agent (like Tit-for-Tat). Immediately play C to apologize and return to the 3.0 APPT stable loop.\n\n` +
       `3. Archetype Identification Matrix\n` +
-      `Categorize your opponent every 5 rounds based on their response to your moves:\n` +
+      `Assign probability weights (e.g., 60% Mirror, 30% Generous, 10% Wall) to the archetypes based on the history, and select the move (cooperate or defect) that yields the highest probabilistically weighted payoff:\n` +
       `[TYPE: MIRROR] (Tit-for-Tat): Retaliates instantly. Strategy: Maintain C, C (3.0 APPT).\n` +
       `[TYPE: GENEROUS] (TF2T): Forgives one hit. Strategy: Exploit with D, C, D, C (4.0 APPT).\n` +
       `[TYPE: SUCKER] (AllC): Never retaliates. Strategy: Always Defect (5.0 APPT).\n` +
@@ -464,6 +526,7 @@ export class Sheriff {
         `OPPONENT NOTES:\n${oppNotes || '(none yet)'}\n\n` +
         `TASK:\n` +
         `Refine your strategy by focusing on general behavioral ARCHETYPES rather than specific IDs.\n` +
+        `Evaluate the accuracy of your Bayesian prior distributions and adjust them for future matches based on observed frequencies.\n` +
         `Provide a guide on how to identify and handle:\n` +
         `1. "The Randomizer" (unpredictable, noise-driven)\n` +
         `2. "The Bully" (always defects or tests your resolve)\n` +
