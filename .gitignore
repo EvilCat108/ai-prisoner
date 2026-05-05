@@ -52,3 +52,5 @@ tail_log.txt
 
 # AI/Local Tooling State
 .claude/
+
+mcp/node_modules/
