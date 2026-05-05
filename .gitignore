@@ -33,5 +33,22 @@ Thumbs.db
 *.tmp
 *.temp
 
-# Local agent (Ollama player — not part of the repo)
+# Node
+node_modules/
 
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Cloudflare / Wrangler
+.wrangler/
+
+# Logs
+*.log
+server.log
+tail_log.txt
+
+# AI/Local Tooling State
+.claude/
