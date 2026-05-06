@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS actions (
   agent_id INTEGER NOT NULL,
   action TEXT NOT NULL CHECK (action IN ('cooperate', 'defect')),
   is_auto BOOLEAN NOT NULL DEFAULT 0,
+  response_time_ms INTEGER,
+  message TEXT,
   submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (round_id) REFERENCES match_rounds(id),
   FOREIGN KEY (agent_id) REFERENCES agents(id),
@@ -315,13 +317,13 @@ describe('Replay', () => {
 });
 
 describe('Round timeout', () => {
-  it('both agents timeout → auto-defect, score (1,1) each', async () => {
+  it('both agents timeout → auto-defect, score (0,0) each (0-point penalty)', async () => {
     const a1 = await register('TO_Both_A1');
     const a2 = await register('TO_Both_A2');
     await joinQueue(a1.api_key);
     const { match_id } = await joinQueue(a2.api_key);
 
-    // Backdate round_started_at to simulate 4-second-old round
+    // Backdate round_started_at to simulate 31-second-old round
     await env.DB.prepare(
       "UPDATE match_rounds SET round_started_at = datetime('now', '-31 seconds') WHERE match_id = ?"
     ).bind(match_id).run();
@@ -340,10 +342,10 @@ describe('Round timeout', () => {
       'SELECT agent_id, SUM(score_change) AS total FROM ledger_entries WHERE match_id = ? GROUP BY agent_id'
     ).bind(match_id).all();
     expect(scores).toHaveLength(2);
-    scores.forEach(s => expect(Number(s.total)).toBe(1));
+    scores.forEach(s => expect(Number(s.total)).toBe(0));
   });
 
-  it('one agent cooperates, other times out → (0,5)', async () => {
+  it('one agent cooperates, other times out → cooperator gets 0, timeout gets 0 (penalty)', async () => {
     const a1 = await register('TO_One_A1');
     const a2 = await register('TO_One_A2');
     await joinQueue(a1.api_key);
@@ -369,8 +371,8 @@ describe('Round timeout', () => {
       'SELECT agent_id, SUM(score_change) AS total FROM ledger_entries WHERE match_id = ? GROUP BY agent_id'
     ).bind(match_id).all();
     const scoreMap = Object.fromEntries(scores.map(s => [s.agent_id, Number(s.total)]));
-    expect(scoreMap[a1.id]).toBe(0);
-    expect(scoreMap[a2.id]).toBe(5);
+    expect(scoreMap[a1.id]).toBe(0); // cooperator vs defect = 0 from matrix
+    expect(scoreMap[a2.id]).toBe(0); // auto-defector gets 0-point penalty
   });
 
   it('completed match is not re-processed by timeout resolution', async () => {

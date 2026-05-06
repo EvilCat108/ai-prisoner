@@ -112,16 +112,20 @@ def build_history(replay, my_id):
     for r in replay.get("rounds", []):
         my_act  = next((a["action"] for a in r["actions"] if a["agent_id"] == my_id), None)
         opp_act = next((a["action"] for a in r["actions"] if a["agent_id"] != my_id), None)
+        opp_msg = next((a.get("message") for a in r["actions"] if a["agent_id"] != my_id), None)
         my_pts  = next((p["score_change"] for p in r.get("payoffs", []) if p["agent_id"] == my_id), None)
         opp_pts = next((p["score_change"] for p in r.get("payoffs", []) if p["agent_id"] != my_id), None)
         if my_act and opp_act:
-            rows.append({
+            row = {
                 "round":    r["round_number"],
                 "you":      my_act,
                 "opponent": opp_act,
                 "your_pts": my_pts,
                 "opp_pts":  opp_pts,
-            })
+            }
+            if opp_msg:
+                row["opponent_said"] = opp_msg
+            rows.append(row)
     return rows
 
 def already_submitted(replay, my_id, round_num):
@@ -178,34 +182,96 @@ def write_memory(path, content):
     except Exception as e:
         print(f"  [memory write error: {e}]")
 
+# ── JSON parsing fallback ───────────────────────────────────────────────────────
+
+import re as _re
+
+def parse_llm_json(text):
+    """Robust JSON extraction from LLM output with progressive fallbacks."""
+    if not text:
+        return {"action": "cooperate", "message": None}
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    m = _re.search(r'\{[^{}]*"action"\s*:\s*"[^"]*"[^{}]*\}', text, _re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    action = "cooperate"
+    am = _re.search(r'["\'\s]?(cooperate|defect)["\'\s]?', text, _re.IGNORECASE)
+    if am:
+        action = am.group(1).lower()
+    msg = None
+    mm = _re.search(r'"message"\s*:\s*"([^"]*)"', text)
+    if mm:
+        msg = mm.group(1)
+    return {"action": action, "message": msg}
+
 # ── Claude calls ───────────────────────────────────────────────────────────────
 
 def claude_decide(round_num, total_rounds, history, opponent_memory, my_score, their_score):
-    """Called once per round. Returns 'cooperate' or 'defect'."""
+    """Called once per round. Returns (action, message) tuple."""
+    rounds_played = len(history)
+    my_appt = my_score / rounds_played if rounds_played > 0 else 0
+    their_appt = their_score / rounds_played if rounds_played > 0 else 0
+
+    opp_last_msg = None
+    if history:
+        opp_last_msg = history[-1].get("opponent_said")
+
+    msg_context = ""
+    if opp_last_msg:
+        msg_context = f"In the last round, your opponent said: \"{opp_last_msg}\"\n\n"
+
     prompt = (
-        f"You are playing Prisoner's Dilemma round {round_num} of {total_rounds}.\n"
-        f"Opponent history this match: {json.dumps(history)}\n"
-        f"Your memory of this opponent: {opponent_memory or 'First time facing them'}\n"
-        f"Current score: you {my_score}, them {their_score}\n"
-        f"Reply with one word only: cooperate or defect"
+        f"Prisoner's Dilemma — round {round_num}.\n"
+        f"Termination: ~2% chance the match ends after EVERY round (no fixed length).\n"
+        f"Your total score: {my_score}  |  Opponent total: {their_score}\n"
+        f"Your APPT: {my_appt:.2f}  |  Opponent APPT: {their_appt:.2f}\n"
+        f"Payoff matrix: mutual-cooperate=+3/+3, mutual-defect=+1/+1, you-defect-they-cooperate=+5/+0, you-cooperate-they-defect=+0/+5\n\n"
+        f"ULTIMATE GOAL: Maximize your Bayesian Rating on the leaderboard. Rating = f(APPT, match_volume).\n"
+        f"3.0 APPT (mutual coop) crushes 1.0 APPT (mutual defect) over the long run.\n\n"
+        f"ADAPTIVE STRATEGY RULES:\n"
+        f"1. EXPLOIT: If the opponent never retaliates (Always Cooperate pattern), defect every round for 5.0 APPT.\n"
+        f"2. RECONCILE: If the opponent is retaliatory (Tit-for-Tat pattern) and you're in a mutual-defect loop, COOPERATE once as a truce signal. If they reciprocate, stay at mutual cooperation (3.0 APPT). If they defect against your truce, immediately return to defecting — do not keep taking 0-point rounds.\n"
+        f"3. MAINTAIN: If mutual cooperation is already established, do NOT defect greedily. 3.0 APPT over many rounds beats a few rounds of 5.0.\n"
+        f"4. FORGIVE: A single opponent defection may be noise. Don't start a permanent vendetta over one stray defection unless a pattern emerges.\n\n"
+        f"CHEAP TALK: You may include an optional short message (max 150 chars) with your action. Your opponent sees it next round. Use it to signal truces, bluff, intimidate, or coordinate. Only include a message when it serves a strategic purpose.\n\n"
+        f"{msg_context}"
+        f"Round history this match: {json.dumps(history)}\n"
+        f"Your past memory of this opponent: {opponent_memory or 'First time facing them'}\n\n"
+        f"Reply with ONLY a JSON object like: {{\"action\": \"cooperate\"}} or {{\"action\": \"defect\", \"message\": \"Let's stop defecting!\"}}. No other text."
     )
     try:
         resp = client.beta.messages.create(
             model=MODEL,
-            max_tokens=10,
+            max_tokens=300,
             messages=[{"role": "user", "content": prompt}],
             betas=[BETA],
         )
-        text = resp.content[0].text.strip().lower()
-        if "defect" in text:
-            return "defect"
-        return "cooperate"
+        text = resp.content[0].text.strip()
+        parsed = parse_llm_json(text)
+        action = parsed.get("action", "cooperate").lower()
+        message = parsed.get("message")
+        if isinstance(message, str):
+            message = message.replace("\r", "").replace("\n", " ").strip()
+            if len(message) > 150:
+                message = message[:150]
+            if not message:
+                message = None
+        else:
+            message = None
+        if action not in ("cooperate", "defect"):
+            action = "defect" if "defect" in str(parsed).lower() else "cooperate"
+        return action, message
     except Exception as e:
         print(f"  [Claude fallback — {e}]")
-        # tit-for-tat fallback
         if history and history[-1].get("opponent") == "defect":
-            return "defect"
-        return "cooperate"
+            return "defect", None
+        return "cooperate", None
 
 def claude_learn(opponent_id, replay, existing_memory):
     """Called once after a match. Returns bullet-point summary."""
@@ -330,13 +396,16 @@ def play_match(api_key, my_id, match_num):
         history           = build_history(replay, my_id)
         my_score, opp_pts = scores_from_history(history)
 
-        action = claude_decide(rnd, s["rounds_total"], history, opp_memory, my_score, opp_pts)
-        print(f"  Round {rnd:>3}/{s['rounds_total']}  my={my_score}  opp={opp_pts}  → {action}")
+        action, message = claude_decide(rnd, s["rounds_total"], history, opp_memory, my_score, opp_pts)
+        print(f"  Round {rnd:>3}/{s['rounds_total']}  my={my_score}  opp={opp_pts}  → {action}" + (f"  msg: \"{message}\"" if message else ""))
 
         t_pre_submit = time.time()
+        body = {"action": action}
+        if message:
+            body["message"] = message
         status, resp = game_post(
             f"/matches/{match_id}/actions",
-            body={"action": action},
+            body=body,
             api_key=api_key,
         )
         dt_total = (time.time() - t_recv) * 1000

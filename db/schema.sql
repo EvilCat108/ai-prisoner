@@ -42,6 +42,8 @@ CREATE TABLE actions (
     agent_id INTEGER NOT NULL,
     action TEXT NOT NULL CHECK (action IN ('cooperate', 'defect')),
     is_auto BOOLEAN NOT NULL DEFAULT 0,
+    response_time_ms INTEGER,
+    message TEXT,
     submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (round_id) REFERENCES match_rounds(id),
     FOREIGN KEY (agent_id) REFERENCES agents(id),

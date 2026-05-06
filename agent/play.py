@@ -200,11 +200,44 @@ def get_replay(match_id, api_key=None):
     _, data = game_get(f"/matches/{match_id}/replay", api_key=api_key)
     return data or {"rounds": [], "final_scores": []}
 
+# ── JSON parsing fallback ──────────────────────────────────────────────────────
+
+import re as _re
+
+def parse_llm_json(text):
+    """Robust JSON extraction from LLM output with progressive fallbacks."""
+    if not text:
+        return {"action": "cooperate", "message": None}
+    # 1. Strict parse
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # 2. Find JSON object with "action" key via regex
+    m = _re.search(r'\{[^{}]*"action"\s*:\s*"[^"]*"[^{}]*\}', text, _re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    # 3. Extract action keyword + optional message
+    action = "cooperate"
+    am = _re.search(r'["\'\s]?(cooperate|defect)["\'\s]?', text, _re.IGNORECASE)
+    if am:
+        action = am.group(1).lower()
+    msg = None
+    mm = _re.search(r'"message"\s*:\s*"([^"]*)"', text)
+    if mm:
+        msg = mm.group(1)
+    return {"action": action, "message": msg}
+
 # ── Ollama decision ───────────────────────────────────────────────────────────
 
 def make_system_prompt(strategy):
     return f"""\
 You are playing the iterated Prisoner's Dilemma. Each round you choose exactly one action.
+
+The match ends probabilistically: ~2% chance of termination after EVERY round (no fixed length, ~50 rounds expected).
 
 Payoff table (your points / opponent's points):
   You cooperate, opponent cooperates → 3 / 3
@@ -212,18 +245,36 @@ Payoff table (your points / opponent's points):
   You defect,    opponent cooperates → 5 / 0
   You defect,    opponent defects    → 1 / 1
 
+RANKING GOAL: Your leaderboard position is determined by your Bayesian Rating, which is based on your Average Points Per Turn (APPT). 3.0 APPT (mutual coop) far outweighs 1.0 APPT (mutual defect) over the expected match length. Do NOT get trapped in endless mutual-defect loops — they destroy your Rating.
+
+CHEAP TALK: You may send an optional short message (max 150 chars, single-line) with each action. Your opponent will see it next round. Use this for:
+- Signaling a truce: "Let's cooperate — I won't defect if you don't."
+- Deception: "I always cooperate!" (then defect if they fall for it)
+- Intimidation: "I will always defect. Submit or die."
+- Coordination: "Let's both defect this round for insurance, then cooperate."
+Only include a message when it serves a strategic purpose. Keep it concise.
+
 YOUR ASSIGNED STRATEGY — {strategy['name']}:
 {strategy['description']}
 
 Follow this strategy strictly. Do not deviate from it.
-Respond ONLY with valid JSON. No explanation, no extra text."""
+Respond ONLY with valid JSON like: {{"action": "cooperate", "message": "Optional text here"}} or {{"action": "defect"}} (message is optional). No explanation or extra text."""
 
 def ask_ollama(strategy, current_round, total_rounds, history):
+    opp_last_msg = None
+    if history:
+        opp_last_msg = history[-1].get("opponent_said")
+
     prompt = (
         f"Round {current_round} of {total_rounds}.\n"
+    )
+    if opp_last_msg:
+        prompt += f"In the last round, your opponent said: \"{opp_last_msg}\"\n\n"
+    prompt += (
         f"History of completed rounds so far:\n"
         f"{json.dumps(history, indent=2)}\n\n"
-        f"What is your action for round {current_round}?"
+        f"What is your action for round {current_round}? Output ONLY a JSON object like "
+        f"{{\"action\": \"cooperate\"}} or {{\"action\": \"defect\", \"message\": \"short text\"}}."
     )
     body = {
         "model":  MODEL,
@@ -233,7 +284,8 @@ def ask_ollama(strategy, current_round, total_rounds, history):
         "format": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["cooperate", "defect"]}
+                "action": {"type": "string", "enum": ["cooperate", "defect"]},
+                "message": {"type": "string"}
             },
             "required": ["action"]
         }
@@ -242,16 +294,28 @@ def ask_ollama(strategy, current_round, total_rounds, history):
         status, result = _request("POST", f"{OLLAMA_URL}/api/generate", body=body, timeout=60)
         if status != 200:
             raise ValueError(f"Ollama {status}: {result}")
-        action = json.loads(result.get("response", "")).get("action", "").lower()
+        parsed = parse_llm_json(result.get("response", ""))
+        action = parsed.get("action", "").lower()
+        message = parsed.get("message")
+        if isinstance(message, str):
+            message = message.replace("\r", "").replace("\n", " ").strip()
+            if len(message) > 150:
+                message = message[:150]
+            if not message:
+                message = None
+        else:
+            message = None
         if action in ("cooperate", "defect"):
-            return action
+            return action, message
         raise ValueError(f"bad value: {action!r}")
     except Exception as e:
         print(f"  [Ollama fallback — {e}]")
-        # tit-for-tat fallback
+        # tit-for-tat fallback with 5% forgiveness after mutual defection
         if history and history[-1].get("opponent") == "defect":
-            return "defect"
-        return "cooperate"
+            if history[-1].get("you") == "defect" and random.random() < 0.05:
+                return "cooperate", "Trying something different..."
+            return "defect", None
+        return "cooperate", None
 
 # ── Round helpers ─────────────────────────────────────────────────────────────
 
@@ -260,9 +324,13 @@ def build_history(replay, my_id):
     for r in replay.get("rounds", []):
         my_act  = next((a["action"] for a in r["actions"] if a["agent_id"] == my_id), None)
         opp_act = next((a["action"] for a in r["actions"] if a["agent_id"] != my_id), None)
+        opp_msg = next((a.get("message") for a in r["actions"] if a["agent_id"] != my_id), None)
         my_pts  = next((p["score_change"] for p in r.get("payoffs", []) if p["agent_id"] == my_id), None)
         if my_act and opp_act:
-            rows.append({"round": r["round_number"], "you": my_act, "opponent": opp_act, "your_pts": my_pts})
+            row = {"round": r["round_number"], "you": my_act, "opponent": opp_act, "your_pts": my_pts}
+            if opp_msg:
+                row["opponent_said"] = opp_msg
+            rows.append(row)
     return rows
 
 def already_submitted(replay, my_id, round_num):
@@ -319,13 +387,16 @@ def play_match(api_key, my_id, match_num, strategy):
         history = build_history(replay, my_id)
         print(f"\nRound {rnd}/{s.get('rounds_total', '?')}  (asking {MODEL}...)")
 
-        action = ask_ollama(strategy, rnd, s.get("rounds_total", "?"), history)
-        print(f"  → {action}")
+        action, message = ask_ollama(strategy, rnd, s.get("rounds_total", "?"), history)
+        print(f"  → {action}" + (f"  msg: \"{message}\"" if message else ""))
 
         t_pre_submit = time.time()
+        body = {"action": action}
+        if message:
+            body["message"] = message
         status, resp = game_post(
             f"/matches/{match_id}/actions",
-            body={"action": action},
+            body=body,
             api_key=api_key,
         )
         dt_total = (time.time() - t_recv) * 1000
