@@ -251,6 +251,8 @@ def play_match(api_key, my_id, match_num):
     submitted = set()
 
     def process_round():
+        t_recv = time.time()
+        w = time.strftime("%H:%M:%S")
         s = get_state(match_id, api_key)
         if s["status"] in ("completed", "failed"):
             return False
@@ -274,15 +276,17 @@ def play_match(api_key, my_id, match_num):
         action = ask_ollama(rnd, s.get("rounds_total", "?"), history_data)
         print(f"  → {action}")
 
+        t_pre_submit = time.time()
         status, resp = game_post(
             f"/matches/{match_id}/actions",
             body={"action": action},
             api_key=api_key,
         )
+        dt_total = (time.time() - t_recv) * 1000
 
         if status == 200:
             submitted.add(rnd)
-            print(f"  ✓ submitted")
+            print(f"  ✓ submitted  [{w} | recv→submit {dt_total:.0f}ms]")
         elif "already submitted" in str(resp):
             submitted.add(rnd)
         else:
@@ -299,6 +303,13 @@ def play_match(api_key, my_id, match_num):
             headers = {"Authorization": f"Bearer {api_key}"}
             with requests.get(f"{GAME_URL}/stream", headers=headers, stream=True, timeout=3600) as response:
                 response.raise_for_status()
+                # — Sync poll: catch any round that advanced during the SSE connect gap —
+                t_poll = time.time()
+                if not process_round():
+                    break
+                dt_poll = (time.time() - t_poll) * 1000
+                print(f"  [sync poll: {dt_poll:.0f}ms]")
+
                 for line in response.iter_lines():
                     if line:
                         line = line.decode('utf-8')
@@ -310,6 +321,8 @@ def play_match(api_key, my_id, match_num):
                                 ev = json.loads(d)
                                 # If the event belongs to our match, process the round
                                 if ev.get("match_id") == match_id:
+                                    t_event = time.time()
+                                    print(f"  [SSE event at {time.strftime('%H:%M:%S')}] {ev.get('type', '?')} round={ev.get('round', '?')}")
                                     if not process_round():
                                         break # Break the for-loop if match is over
                             except Exception:

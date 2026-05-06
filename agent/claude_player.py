@@ -305,6 +305,8 @@ def play_match(api_key, my_id, match_num):
     submitted = set()
 
     def process_round():
+        t_recv = time.time()
+        w = time.strftime("%H:%M:%S")
         s = get_state(match_id)
         if s is None:
             print("  Match not found — exiting loop.")
@@ -331,13 +333,17 @@ def play_match(api_key, my_id, match_num):
         action = claude_decide(rnd, s["rounds_total"], history, opp_memory, my_score, opp_pts)
         print(f"  Round {rnd:>3}/{s['rounds_total']}  my={my_score}  opp={opp_pts}  → {action}")
 
+        t_pre_submit = time.time()
         status, resp = game_post(
             f"/matches/{match_id}/actions",
             body={"action": action},
             api_key=api_key,
         )
+        dt_total = (time.time() - t_recv) * 1000
+
         if status == 200:
             submitted.add(rnd)
+            print(f"    ✓ submitted  [{w} | recv→submit {dt_total:.0f}ms]")
         elif "already submitted" in str(resp):
             submitted.add(rnd)
         else:
@@ -348,6 +354,13 @@ def play_match(api_key, my_id, match_num):
     if process_round():
         try:
             with requests.get(f"{GAME_URL}/stream", stream=True, timeout=3600) as response:
+                # — Sync poll: catch any round that advanced during the SSE connect gap —
+                t_poll = time.time()
+                if not process_round():
+                    return
+                dt_poll = (time.time() - t_poll) * 1000
+                print(f"  [sync poll: {dt_poll:.0f}ms]")
+
                 for line in response.iter_lines():
                     if line:
                         line = line.decode('utf-8')
@@ -358,8 +371,10 @@ def play_match(api_key, my_id, match_num):
                             try:
                                 ev = json.loads(d)
                                 if ev.get("match_id") == match_id:
+                                    t_event = time.time()
+                                    print(f"  [SSE event at {time.strftime('%H:%M:%S')}] {ev.get('type', '?')} round={ev.get('round', '?')}")
                                     if not process_round():
-                                        break
+                                        return
                             except Exception:
                                 pass
         except Exception as e:
