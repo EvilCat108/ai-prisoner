@@ -12,6 +12,7 @@ This is a **Cloudflare Workers** project. The entry point `index.js` exports a d
 
 ```bash
 npm test                    # vitest run (cloudflare:test env, 30s timeout)
+npm run lint                # syntax-check every JS file (node --check, ESM)
 npx wrangler deploy --env production   # deploy to prod
 npx wrangler secret put DEEPSEEK_API_KEY --env production   # set Umpire LLM key
 ```
