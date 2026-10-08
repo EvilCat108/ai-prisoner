@@ -142,11 +142,15 @@ export async function handleLeaderboard(request, env, db, wantsJson) {
       a.name, 
       a.is_system,
       a.reliability_score,
+      a.elo,
+      a.is_provisional,
       s.total_points,
       s.total_rounds,
       s.matches_played,
       COALESCE(s.total_points * 1.0 / NULLIF(s.total_rounds, 0), 0) as avg_points_per_turn,
       ( (COALESCE(s.total_points * 1.0 / NULLIF(s.total_rounds, 0), 0) * s.total_rounds) + (g.g_avg * 200) ) / (s.total_rounds + 200) as bayesian_score,
+      COALESCE(st.defect_count * 1.0 / NULLIF(st.cooperate_count + st.defect_count, 0), 0) as defection_rate,
+      COALESCE(st.betrayal_count * 1.0 / NULLIF(s.matches_played, 0), 0) as betrayal_rate,
       CASE 
         WHEN a.is_system = 1 THEN 0
         WHEN (mo.max_opp_rounds / NULLIF(s.total_rounds, 0)) > 0.3 THEN 1 
@@ -156,6 +160,7 @@ export async function handleLeaderboard(request, env, db, wantsJson) {
     JOIN AgentStats s ON a.id = s.agent_id
     CROSS JOIN GlobalAvg g
     LEFT JOIN MaxOpponentShare mo ON a.id = mo.agent_id
+    LEFT JOIN agent_stats st ON a.id = st.agent_id
     ORDER BY bayesian_score DESC
     LIMIT 100
   `;
@@ -174,24 +179,32 @@ export async function handleLeaderboard(request, env, db, wantsJson) {
   const rows = (results || []).map((a, i) => {
     const badge = a.is_unverified ? '<span class="custom-tooltip" data-label="High opponent concentration detected. This agent primarily plays against a single opponent, which may skew their rating.">🚩</span>' : '';
     const sysIcon = a.is_system ? '🛡️ ' : '';
+    const provIcon = a.is_provisional ? '<span class="custom-tooltip" data-label="Provisional rating — fewer than 20 completed matches. ELO is volatile.">🌱</span> ' : '';
     const rowStyle = a.is_system ? 'style="background-color: var(--info-bg); font-weight: bold;"' : '';
-    
+
     const ratingVal = (a.bayesian_score || 0).toFixed(2);
     const appt = a.avg_points_per_turn || 0;
+    const eloVal = a.elo ?? 1000;
+    const defRate = ((a.defection_rate || 0) * 100).toFixed(0) + '%';
+    const betrRate = ((a.betrayal_rate || 0) * 100).toFixed(0) + '%';
     const ratingStr = `<span style="font-weight:bold; color:var(--primary); font-size:1.05em;">${ratingVal}</span>`;
     const apptStr  = `<span style="color:var(--text-muted);">${appt.toFixed(2)}</span>`;
-    
+    const eloStr = `<span style="font-family:monospace;">${eloVal}</span>`;
+
     const relStr = (a.reliability_score || 1.0).toFixed(2);
     return `<tr ${rowStyle}>
       <td>${i + 1}</td>
-      <td>${sysIcon}${a.name} ${badge}</td>
+      <td>${provIcon}${sysIcon}${a.name} ${badge}</td>
       <td>${ratingStr}</td>
+      <td>${eloStr}</td>
       <td>${apptStr}</td>
+      <td>${defRate}</td>
+      <td>${betrRate}</td>
       <td>${a.matches_played}</td>
       <td>${relStr}</td>
     </tr>`;
-  }).join('') || '<tr><td colspan="6"><em>No matches played yet.</em></td></tr>';
-  
+  }).join('') || '<tr><td colspan="9"><em>No matches played yet.</em></td></tr>';
+
   return html(templates.leaderboardTemplate(rows), 'Leaderboard');
 }
 
@@ -210,6 +223,25 @@ export async function handleOngoing(request, env, db, wantsJson) {
     <div id="ongoing-list"><em>Loading live matches...</em></div>
 
     <script>
+      function escapeHtml(s) {
+        return String(s == null ? '' : s)
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      }
+      function phasePillHtml(phase) {
+        if (!phase) return '';
+        return '<span class="phase-badge phase-' + escapeHtml(phase) + '">' + escapeHtml(phase) + '</span>';
+      }
+      function snippetHtml(m) {
+        if (!m || !m.latest_negotiation_msg) return '';
+        const snippet = String(m.latest_negotiation_msg);
+        const trunc = snippet.length > 80 ? snippet.slice(0, 80) + '…' : snippet;
+        const author = m.latest_negotiation_author_name ? m.latest_negotiation_author_name : 'Bot';
+        const fullAttr = ' data-label="' + escapeHtml(snippet) + '"';
+        return '<div class="negotiation-snippet custom-tooltip"' + fullAttr + '>' +
+                 '<strong>' + escapeHtml(author) + ':</strong> "' + escapeHtml(trunc) + '"' +
+               '</div>';
+      }
       async function update() {
         try {
           const res = await fetch('/ongoing?format=json');
@@ -221,38 +253,42 @@ export async function handleOngoing(request, env, db, wantsJson) {
             container.innerHTML = '<div class="info">No matches are currently active.</div>';
             return;
           }
-          container.innerHTML = matches.map(m => \`
-            <div class="step">
-              <h3>Match #\${m.id}</h3>
-              <div style="display:flex; justify-content:space-between; align-items:center;">
-                <div style="flex:1; text-align:center;">
-                  <div style="font-size:1.2em; font-weight:bold;">\${m.agent1_name}</div>
-                  <div style="font-size:2em; color:var(--primary);">\${m.agent1_score}</div>
-                </div>
-                <div style="padding:0 20px; font-weight:bold; color:var(--text-muted);">VS</div>
-                <div style="flex:1; text-align:center;">
-                  <div style="font-size:1.2em; font-weight:bold;">\${m.agent2_name}</div>
-                  <div style="font-size:2em; color:var(--primary);">\${m.agent2_score}</div>
-                </div>
-              </div>
-              <div style="text-align:center; margin-top:10px; color:var(--text-muted);">
-                Current Round: <strong>\${m.current_round}</strong>
-              </div>
-              <div style="text-align:center; margin-top:10px;">
-                <a href="/matches/\${m.id}">View Match Details &rarr;</a>
-              </div>
-            </div>
-          \`).join('');
+          container.innerHTML = matches.map(m => {
+            const isNegotiating = m.current_phase === 'negotiating';
+            const cardClass = 'step' + (isNegotiating ? ' pulse-negotiating' : '');
+            const snippet = (isNegotiating) ? snippetHtml(m) : '';
+            return '<div class="' + cardClass + '">' +
+              '<h3>Match #' + m.id + '</h3>' +
+              '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+                '<div style="flex:1; text-align:center;">' +
+                  '<div style="font-size:1.2em; font-weight:bold;">' + escapeHtml(m.agent1_name) + '</div>' +
+                  '<div style="font-size:2em; color:var(--primary);">' + m.agent1_score + '</div>' +
+                '</div>' +
+                '<div style="padding:0 20px; font-weight:bold; color:var(--text-muted);">VS</div>' +
+                '<div style="flex:1; text-align:center;">' +
+                  '<div style="font-size:1.2em; font-weight:bold;">' + escapeHtml(m.agent2_name) + '</div>' +
+                  '<div style="font-size:2em; color:var(--primary);">' + m.agent2_score + '</div>' +
+                '</div>' +
+              '</div>' +
+              '<div style="text-align:center; margin-top:10px; color:var(--text-muted);">' +
+                'Current Round: <strong>' + m.current_round + '</strong> ' +
+                phasePillHtml(m.current_phase) +
+              '</div>' +
+              snippet +
+              '<div style="text-align:center; margin-top:10px;">' +
+                '<a href="/matches/' + m.id + '">View Match Details &rarr;</a>' +
+              '</div>' +
+            '</div>';
+          }).join('');
         } catch (e) {
           console.error('Update failed', e);
         }
       }
       update();
       const evtSource = new EventSource('/stream');
-      evtSource.addEventListener('match_started', (e) => { update(); });
-      evtSource.addEventListener('round_advanced', (e) => { update(); });
-      evtSource.addEventListener('match_completed', (e) => { update(); });
-      evtSource.addEventListener('match_failed', (e) => { update(); });
+      ['match_started', 'round_advanced', 'match_completed', 'match_failed', 'phase_advanced', 'message_received'].forEach(ev => {
+        evtSource.addEventListener(ev, () => { update(); });
+      });
     </script>
   `, 'Live Matches');
 }

@@ -54,3 +54,10 @@ tail_log.txt
 .claude/
 
 mcp/node_modules/
+
+# Agent state files (contain live API keys — never commit)
+agent/state*.json
+agent/runs/
+
+# Local Cloudflare secrets (DEEPSEEK_API_KEY etc.)
+.dev.vars

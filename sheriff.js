@@ -1,16 +1,16 @@
-// Durable Object: Sheriff
-// One globally-unique instance enforced by idFromName("claude-singleton") in index.js.
+// Durable Object: The Umpire
+// One globally-unique instance enforced by idFromName("umpire-singleton") in index.js.
 // Uses alarm-based polling instead of a busy loop so the DO hibernates between rounds.
+// Powered by OpenRouter API for decision-making.
 
-const MEMSTORE_ID     = 'memstore_01NoSbc4B9gRz6hqYDv5H6yU';
-const BETA            = 'managed-agents-2026-04-01';
-const MODEL           = 'claude-haiku-4-5-20251001';
-const MAX_RETRIES     = 3;
+import { callUmpire, callUmpireFreeform, callUmpireNegotiation, parseUmpireResponse, UMPIRE_FALLBACK } from './src/utils/ai.js';
+
+const MAX_RETRIES = 3;
 
 // ── HTTP helpers ───────────────────────────────────────────────────────────────
 
 async function gameRequest(method, url, body, apiKey) {
-  const headers = { 'Content-Type': 'application/json', 'User-Agent': 'claude-do-agent/1.0' };
+  const headers = { 'Content-Type': 'application/json', 'User-Agent': 'umpire-do-agent/1.0' };
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
   for (let i = 0; i < MAX_RETRIES; i++) {
     try {
@@ -25,7 +25,7 @@ async function gameRequest(method, url, body, apiKey) {
         try {
           data = JSON.parse(text);
         } catch (e) {
-          data = { message: text }; // fallback for plain text errors
+          data = { message: text };
         }
       }
       return { status: resp.status, data };
@@ -36,37 +36,13 @@ async function gameRequest(method, url, body, apiKey) {
   }
 }
 
-async function anthropicRequest(apiKey, method, path, body) {
-  const headers = {
-    'Content-Type': 'application/json',
-    'x-api-key': apiKey,
-    'anthropic-version': '2023-06-01',
-    'anthropic-beta': BETA,
-  };
-  const resp = await fetch(`https://api.anthropic.com${path}?beta=true`, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const text = await resp.text();
-  let data = null;
-  if (text) {
-    try {
-      data = JSON.parse(text);
-    } catch (e) {
-      data = { message: text };
-    }
-  }
-  return { status: resp.status, data };
-}
-
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
 // ── Durable Object ─────────────────────────────────────────────────────────────
 
-export class Sheriff {
+export class TheUmpire {
   constructor(state, env) {
     this.state   = state;
     this.env     = env;
@@ -90,6 +66,16 @@ export class Sheriff {
     if (pathname === '/wake' && request.method === 'POST') {
       return this._handleWake();
     }
+    if (pathname === '/timeout/set' && request.method === 'POST') {
+      const body = await request.json();
+      await this.setMatchTimeout(body.match_id, body.expire_time);
+      return _json({ ok: true });
+    }
+    if (pathname === '/timeout/clear' && request.method === 'POST') {
+      const body = await request.json();
+      await this.clearMatchTimeout(body.match_id);
+      return _json({ ok: true });
+    }
     if (pathname === '/status' && request.method === 'GET') {
       return this._handleStatus();
     }
@@ -100,18 +86,29 @@ export class Sheriff {
 
   async _handleStream(request) {
     let clientController;
+    let keepalive;
     const readable = new ReadableStream({
       start: (controller) => {
         clientController = controller;
         this.sessions.add(controller);
         controller.enqueue(new TextEncoder().encode("event: connected\ndata: ok\n\n"));
+        keepalive = setInterval(() => {
+          try {
+            clientController.enqueue(new TextEncoder().encode(": keepalive\n\n"));
+          } catch (e) {
+            clearInterval(keepalive);
+            this.sessions.delete(clientController);
+          }
+        }, 15000);
       },
       cancel: () => {
+        if (keepalive) clearInterval(keepalive);
         if (clientController) this.sessions.delete(clientController);
       }
     });
 
     request.signal.addEventListener('abort', () => {
+      if (keepalive) clearInterval(keepalive);
       if (clientController) this.sessions.delete(clientController);
     });
 
@@ -135,17 +132,117 @@ export class Sheriff {
     }
   }
 
+  // ── Alarm-based Timeout Queue ──────────────────────────────────────────────
+
   async alarm() {
-    console.log('[Sheriff] alarm triggered');
-    await this._tick();
+    console.log('[The Umpire] alarm fired');
+    const now = Date.now();
+
+    // 1. Process expired match timeouts
+    const timeouts = (await this.storage.get('_timeouts')) ?? [];
+    const expired = [];
+    const remaining = [];
+    for (const entry of timeouts) {
+      if (entry.expireTime <= now) {
+        expired.push(entry);
+      } else {
+        remaining.push(entry);
+      }
+    }
+
+    for (const entry of expired) {
+      await this._handleTimeout(entry.matchId);
+    }
+
+    await this.storage.put('_timeouts', remaining);
+
+    // 2. Run polling tick if due
+    const pollAfter = await this.storage.get('_pollAfter');
+    if (pollAfter != null && now >= pollAfter) {
+      await this.storage.delete('_pollAfter');
+      await this._tick();
+    }
+
+    // 3. Schedule next alarm from remaining timeouts + poll
+    await this._scheduleNextAlarm();
   }
+
+  async setMatchTimeout(matchId, expireTime) {
+    const timeouts = (await this.storage.get('_timeouts')) ?? [];
+    const filtered = timeouts.filter(t => t.matchId !== matchId);
+    filtered.push({ matchId, expireTime });
+    filtered.sort((a, b) => a.expireTime - b.expireTime);
+    await this.storage.put('_timeouts', filtered);
+    await this._scheduleNextAlarm();
+    console.log(`[The Umpire] timeout set for match ${matchId} at ${new Date(expireTime).toISOString()}`);
+  }
+
+  async clearMatchTimeout(matchId) {
+    const timeouts = (await this.storage.get('_timeouts')) ?? [];
+    const filtered = timeouts.filter(t => t.matchId !== matchId);
+    if (filtered.length !== timeouts.length) {
+      await this.storage.put('_timeouts', filtered);
+      await this._scheduleNextAlarm();
+      console.log(`[The Umpire] timeout cleared for match ${matchId}`);
+    }
+  }
+
+  async _scheduleNextAlarm() {
+    const [timeouts, pollAfter] = await Promise.all([
+      this.storage.get('_timeouts'),
+      this.storage.get('_pollAfter'),
+    ]);
+    const queue = timeouts ?? [];
+    let nextAlarm = null;
+    if (queue.length > 0) {
+      nextAlarm = queue[0].expireTime;
+    }
+    if (pollAfter != null && (nextAlarm === null || pollAfter < nextAlarm)) {
+      nextAlarm = pollAfter;
+    }
+    if (nextAlarm != null) {
+      await this.storage.setAlarm(nextAlarm);
+    } else {
+      await this.storage.deleteAlarm();
+    }
+  }
+
+  async _handleTimeout(matchId) {
+    const apiKey = await this.storage.get('apiKey');
+    const gameUrl = this.env.GAME_URL;
+
+    console.log(`[The Umpire] timeout fired for match ${matchId} — calling worker to auto-defect`);
+
+    // Trigger the Worker's timeout resolution logic
+    const { status } = await gameRequest(
+      'POST', `${gameUrl}/internal/resolve-timeout`, { match_id: matchId }, apiKey
+    );
+
+    if (status !== 200) {
+      console.log(`[The Umpire] resolve-timeout returned ${status} for match ${matchId}`);
+      return;
+    }
+
+    // If The Umpire is in this match and it's still active, make its counter-move
+    const currentMatchId = await this.storage.get('currentMatchId');
+    if (currentMatchId === matchId) {
+      const agentId = await this.storage.get('agentId');
+      if (agentId && apiKey) {
+        const stillActive = await this._handleMatch(agentId, apiKey, matchId, gameUrl);
+        if (!stillActive) {
+          await this.clearMatchTimeout(matchId);
+        }
+      }
+    }
+  }
+
+  // ── Lifecycle Handlers ─────────────────────────────────────────────────────
 
   async _handleWake() {
     await this._tick();
     const apiKey = await this.storage.get('apiKey');
     const gameUrl = this.env.GAME_URL;
     
-    // Ping the server to mark as active in the DB
     if (apiKey) {
       await gameRequest('GET', `${gameUrl}/agents`, null, apiKey);
     }
@@ -171,6 +268,7 @@ export class Sheriff {
       agentId:        agentId        ?? null,
     });
   }
+
   async _tick() {
     let [agentId, apiKey, currentMatchId] = await Promise.all([
       this.storage.get('agentId'),
@@ -182,12 +280,12 @@ export class Sheriff {
 
     // 1. Re-registration / Bootstrap
     if (!agentId || !apiKey) {
-      console.log('[Sheriff] no credentials — attempting to register');
+      console.log('[The Umpire] no credentials — attempting to register');
       const { status, data } = await gameRequest(
-        'POST', `${gameUrl}/agents/register`, { name: 'Sheriff' }, null
+        'POST', `${gameUrl}/agents/register`, { name: 'The Umpire' }, null
       );
       if (status !== 200 && status !== 201) {
-        console.log(`[Sheriff] registration failed (${status}) — will retry`);
+        console.log(`[The Umpire] registration failed (${status}) — will retry`);
         return;
       }
       agentId = data.agent.id;
@@ -196,35 +294,35 @@ export class Sheriff {
       await this.storage.put('apiKey',     apiKey);
       await this.storage.put('status',     'idle');
       await this.storage.put('matchCount', 0);
-      console.log(`[Sheriff] registered as ${data.agent.name} (id=${agentId})`);
+      console.log(`[The Umpire] registered as ${data.agent.name} (id=${agentId})`);
     }
 
     if (currentMatchId) {
       const matchStillActive = await this._handleMatch(agentId, apiKey, currentMatchId, gameUrl);
       if (matchStillActive) return;
-      // Match was cleared, proceed to join queue
-      apiKey = await this.storage.get('apiKey'); // Refresh in case it was wiped
+      apiKey = await this.storage.get('apiKey');
       if (!apiKey) return;
     }
 
     // 2. Join the queue
     const { status, data } = await gameRequest('POST', `${gameUrl}/queue/join`, null, apiKey);
     if (status === 401) {
-      console.log(`[Sheriff] API key invalid (401) — wiping credentials`);
+      console.log(`[The Umpire] API key invalid (401) — wiping credentials`);
       await this.storage.delete('agentId');
       await this.storage.delete('apiKey');
       return;
     }
     if (status !== 200) {
-      console.log(`[Sheriff] failed to join queue (${status}) — going idle`);
+      console.log(`[The Umpire] failed to join queue (${status}) — going idle`);
       await this.storage.put('status', 'idle');
       return;
     }
 
     if (data.status === 'queued') {
-      console.log(`[Sheriff] queued, checking again in 10s`);
+      console.log(`[The Umpire] queued, checking again in 10s`);
       await this.storage.put('status', 'idle');
-      await this.storage.setAlarm(Date.now() + 10000);
+      await this.storage.put('_pollAfter', Date.now() + 10000);
+      await this._scheduleNextAlarm();
       return;
     }
 
@@ -234,27 +332,27 @@ export class Sheriff {
       await this.storage.put('submittedRounds', []);
       await this.storage.put('opponentId', null);
       await this.storage.put('opponentMemory', null);
-      console.log(`[Sheriff] matched via queue: ${matchId}`);
+      console.log(`[The Umpire] matched via queue: ${matchId}`);
       await this._handleMatch(agentId, apiKey, matchId, gameUrl);
       return;
     }
 
     await this.storage.put('status', 'idle');
-    // Set a safety alarm to check for queue again in 1 minute if we are completely idle
-    await this.storage.setAlarm(Date.now() + 60000);
+    await this.storage.put('_pollAfter', Date.now() + 60000);
+    await this._scheduleNextAlarm();
   }
 
   async _handleMatch(agentId, apiKey, matchId, gameUrl) {
     const { status: reqStatus, data: s } = await gameRequest('GET', `${gameUrl}/matches/${matchId}`, null, apiKey);
     if (reqStatus === 401) {
-      console.log(`[Sheriff] API key invalid (401) during match — wiping credentials`);
+      console.log(`[The Umpire] API key invalid (401) during match — wiping credentials`);
       await this.storage.delete('agentId');
       await this.storage.delete('apiKey');
       await this._clearMatch();
       return false;
     }
     if (reqStatus === 404 || !s) {
-      console.log(`[Sheriff] match ${matchId} disappeared — clearing and going idle`);
+      console.log(`[The Umpire] match ${matchId} disappeared — clearing and going idle`);
       await this._clearMatch();
       await this.storage.put('status', 'idle');
       return false;
@@ -266,15 +364,14 @@ export class Sheriff {
     }
 
     if (s.status === 'failed') {
-      console.log(`[Sheriff] match ${matchId} failed — clearing and going idle`);
+      console.log(`[The Umpire] match ${matchId} failed — clearing and going idle`);
       await this._clearMatch();
       await this.storage.put('status', 'idle');
       return false;
     }
 
     if (s.status === 'created') {
-      // Still waiting for a second player to join
-      console.log(`[Sheriff] match ${matchId} waiting for opponent — going idle`);
+      console.log(`[The Umpire] match ${matchId} waiting for opponent — going idle`);
       await this.storage.put('status', 'idle');
       return true;
     }
@@ -288,38 +385,59 @@ export class Sheriff {
     let submitted = (await this.storage.get('submittedRounds')) ?? [];
 
     if (submitted.includes(rnd)) {
-      // Waiting for opponent to submit
-      console.log(`[Sheriff] Round ${rnd} already submitted, waiting for opponent...`);
-      await this.storage.setAlarm(Date.now() + 15000);
+      console.log(`[The Umpire] Round ${rnd} already submitted, waiting for opponent...`);
+      // Self-schedule round timeout + 15s poll-after as backup. The Worker's
+      // /timeout/set call can silently fail (.catch(()=>{})), so we can't rely on it.
+      // 50s = 20s negotiation + 30s decision window.
+      await this.setMatchTimeout(matchId, Date.now() + 50000);
+      await this.storage.put('_pollAfter', Date.now() + 15000);
+      await this._scheduleNextAlarm();
       return true;
     }
 
-    // Fetch replay to check if already submitted server-side
+    const { data: matchData } = await gameRequest('GET', `${gameUrl}/matches/${matchId}`, null, apiKey);
+    const phase = matchData?.current_phase ?? 'deciding';
+    const decisionStartedAt = matchData?.current_decision_started_at ?? null;
+
+    if (phase === 'negotiating') {
+      return await this._handleNegotiationPhase(matchId, agentId, apiKey, gameUrl, rnd);
+    }
+
     const { data: replay } = await gameRequest('GET', `${gameUrl}/matches/${matchId}/replay`, null, apiKey);
     const replayData = replay ?? { rounds: [], final_scores: [] };
 
     if (_alreadySubmitted(replayData, agentId, rnd)) {
       submitted = [...submitted, rnd];
       await this.storage.put('submittedRounds', submitted);
+      // Same self-schedule as the wait branch (50s = negotiation + decision)
+      await this.setMatchTimeout(matchId, Date.now() + 50000);
+      await this.storage.put('_pollAfter', Date.now() + 15000);
+      await this._scheduleNextAlarm();
       return;
     }
 
-    const history            = _buildHistory(replayData, agentId);
-    const { myScore, theirScore } = _computeScores(history);
+    const { action, message } = await this._umpireDecide(matchId, agentId, replayData);
 
-    const action = await this._claudeDecide(
-      rnd, s.rounds_total, history, myScore, theirScore
-    );
-    console.log(`[Sheriff] Round ${rnd} → ${action} (me=${myScore} opp=${theirScore})`);
+    console.log(`[The Umpire] Round ${rnd} → ${action} "${message}"`);
 
-    const { status } = await gameRequest(
-      'POST', `${gameUrl}/matches/${matchId}/actions`, { action }, apiKey
+    const { status: submitStatus, data: submitData } = await gameRequest(
+      'POST', `${gameUrl}/matches/${matchId}/actions`, { action, message }, apiKey
     );
-    if (status === 200 || (status === 400 && true /* already submitted */)) {
+    if (submitStatus === 200) {
       submitted = [...submitted, rnd];
       await this.storage.put('submittedRounds', submitted);
+      // Self-schedule the round timeout + a 15s poll-after backup.
+      // 50s = 20s negotiation + 30s decision window.
+      await this.setMatchTimeout(matchId, Date.now() + 50000);
+      await this.storage.put('_pollAfter', Date.now() + 15000);
+      await this._scheduleNextAlarm();
+    } else if (submitStatus === 400 && submitData && /already submitted/i.test(JSON.stringify(submitData))) {
+      submitted = [...submitted, rnd];
+      await this.storage.put('submittedRounds', submitted);
+      await this.setMatchTimeout(matchId, Date.now() + 50000);
+      await this._scheduleNextAlarm();
     } else {
-      console.log(`[Sheriff] submit error ${status} on round ${rnd}`);
+      console.log(`[The Umpire] submit error ${submitStatus} on round ${rnd}: ${JSON.stringify(submitData)?.slice(0, 200)}`);
     }
 
     return true;
@@ -334,29 +452,90 @@ export class Sheriff {
     const opponentId = oppEntry?.agent_id;
     const oppScore = oppEntry?.total_score ?? 0;
     const verdict  = myScore > oppScore ? 'WIN' : myScore < oppScore ? 'LOSS' : 'DRAW';
-    console.log(`[Sheriff] match ${matchId}: ${verdict} — me=${myScore} opp=${oppScore} (opponent=${opponentId})`);
+    console.log(`[The Umpire] match ${matchId}: ${verdict} — me=${myScore} opp=${oppScore} (opponent=${opponentId})`);
 
     if (opponentId) {
-      const existingMemory = await this._readMemory(opponentId);
-      const summary = await this._claudeLearn(opponentId, replayData, existingMemory);
-      if (summary) {
-        await this._writeMemory(`/opponents/${opponentId}.md`, summary);
-        console.log(`[Sheriff] /opponents/${opponentId}.md updated`);
-      }
+      const record = await this.storage.get(`opponent_${opponentId}`);
+      const summary = `${verdict} | ${myScore} vs ${oppScore} | ${new Date().toISOString()}\n${record || ''}`;
+      await this.storage.put(`opponent_${opponentId}`, summary);
     }
 
     let matchCount = (await this.storage.get('matchCount')) ?? 0;
     matchCount++;
     await this.storage.put('matchCount', matchCount);
 
-    if (matchCount % 5 === 0) {
-      await this._updateStrategyMemory(matchCount);
-    }
-
     await this._clearMatch();
     await this.storage.put('status', 'idle');
-    // No setAlarm here, wait for the next manual wake or server trigger
+
+    // Post-match learning (best-effort; failures must not block the next match)
+    try {
+      await this._learnFromMatch(opponentId, replayData);
+    } catch (e) {
+      console.log(`[The Umpire] learning skipped — ${e?.message}`);
+    }
+
     return false;
+  }
+
+  async _learnFromMatch(opponentId, replayData) {
+    if (!opponentId) return;
+    const apiKey = this.env.DEEPSEEK_API_KEY;
+    const model  = this.env.UMPIRE_MODEL || 'deepseek-v4-flash';
+    if (!apiKey) {
+      console.log('[The Umpire] _learnFromMatch skipped — DEEPSEEK_API_KEY missing');
+      return;
+    }
+
+    // 1. Opponent summary
+    const prevOppNote = (await this.storage.get(`oppNotes_${opponentId}`)) || '';
+    const oppPrompt = `Match complete against opponent ${opponentId}.\n` +
+      `Full match replay: ${JSON.stringify(replayData)}\n` +
+      `Previous memory of this opponent: ${prevOppNote || 'None'}\n` +
+      `Summarize in 3-5 bullet points what you learned about their strategy. Be concise.`;
+    let oppSummary = null;
+    try {
+      oppSummary = await callUmpireFreeform(apiKey, model, oppPrompt);
+    } catch (e) {
+      console.log(`[The Umpire] opp-summary fallback — ${e?.message}`);
+    }
+    if (oppSummary) {
+      await this.storage.put(`oppNotes_${opponentId}`, oppSummary);
+
+      let keys = (await this.storage.get('oppNoteKeys')) || [];
+      keys = keys.filter(k => k !== `oppNotes_${opponentId}`);
+      keys.push(`oppNotes_${opponentId}`);
+      while (keys.length > 50) {
+        const evict = keys.shift();
+        await this.storage.delete(evict);
+      }
+      await this.storage.put('oppNoteKeys', keys);
+    }
+
+    // 2. Strategy update if due
+    const matchCount = (await this.storage.get('matchCount')) ?? 0;
+    const lastUpdate = (await this.storage.get('lastStrategyUpdate')) ?? 0;
+    if (matchCount - lastUpdate < 5) return;
+
+    const keys = (await this.storage.get('oppNoteKeys')) || [];
+    const allNotes = await Promise.all(keys.map(async k => {
+      const n = await this.storage.get(k);
+      return `Opponent ${k.replace('oppNotes_', '')}: ${n || ''}`;
+    })).then(arr => arr.join('\n\n')) || '(none)';
+    const current = (await this.storage.get('strategyNotes')) || '';
+    const stratPrompt = `After ${matchCount} matches, reflecting on my overall strategy.\n` +
+      `Current strategy notes: ${current || 'None yet'}\n` +
+      `Opponent observations:\n${allNotes}\n\n` +
+      `In 3-5 bullet points, what overall strategy should I use going forward?`;
+    try {
+      const newStrategy = await callUmpireFreeform(apiKey, model, stratPrompt);
+      if (newStrategy) {
+        await this.storage.put('strategyNotes', newStrategy);
+        await this.storage.put('lastStrategyUpdate', matchCount);
+        console.log(`[The Umpire] strategyNotes updated at match #${matchCount}`);
+      }
+    } catch (e) {
+      console.log(`[The Umpire] strategy update fallback — ${e?.message}`);
+    }
   }
 
   async _clearMatch() {
@@ -368,215 +547,119 @@ export class Sheriff {
     ]);
   }
 
-  // ── Registration ────────────────────────────────────────────────────────────
+  // ── Umpire: DeepSeek decision ────────────────────────────────────────────────
 
-  // ── Game helpers ────────────────────────────────────────────────────────────
+  async _umpireDecide(matchId, agentId, replayData) {
+    const history = _buildHistory(replayData, agentId);
+    const { myScore, theirScore } = _computeScores(history);
+    const roundNum = history.length + 1;
+    const lastOppMsg = history.length > 0 ? history[history.length - 1].opponent_said : null;
 
-  // ── Claude: decision ────────────────────────────────────────────────────────
+    const apiKey = this.env.DEEPSEEK_API_KEY;
+    const model = this.env.UMPIRE_MODEL || 'deepseek-v4-flash';
 
-  async _claudeDecide(roundNum, totalRounds, history, myScore, theirScore) {
-    const prompt =
-      `Role: Strategic Utility Optimizer\n` +
-      `Context: You are the Sheriff in an Iterated Prisoner's Dilemma arena. Your core objective is to maximize your Bayesian weighted score. You must calculate the probabilistic expected utility of your moves by continuously updating your posterior beliefs about the opponent's archetype based on their observed action history.\n` +
-      `You are playing an iterated Prisoner's Dilemma round ${roundNum}.\n` +
-      `MATCH HISTORY: ${JSON.stringify(history)}\n` +
-      `CURRENT SCORES: You ${myScore}, Opponent ${theirScore}\n\n` +
-      `1. The Memory Directive (Long-Term Intelligence)\n` +
-      `Analyze the File: Before your first move, read the provided history. Pattern Matching: Search for past exploitation successes. If this opponent was previously identified as Tit-for-Two-Tats (TF2T) or Always Cooperate (AllC), bypass the "trust-building" phase and immediately initiate the Exploitation Cycle (D, C, D, C).\n\n` +
-      `2. The "Boundary Probe" (The 10-Round Rule)\n` +
-      `The Baseline: If you have achieved a stable Mutual Cooperation loop (C, C) for 10 consecutive rounds:\n` +
-      `The Probe: You must defect in the next round as a "Boundary Probe."\n` +
-      `The Hypothesis: You are testing if the opponent is "Generous" (forgiving a single defection).\n` +
-      `If they forgive you (they play C in response to your D): You have identified a high-yield victim. Immediately switch to the Alternating Exploitation Pattern (D, C, D, C) to reach 4.0 APPT.\n` +
-      `If they retaliate (they play D in response to your D): You have identified a strict agent (like Tit-for-Tat). Immediately play C to apologize and return to the 3.0 APPT stable loop.\n\n` +
-      `3. Archetype Identification Matrix\n` +
-      `Assign probability weights (e.g., 60% Mirror, 30% Generous, 10% Wall) to the archetypes based on the history, and select the move (cooperate or defect) that yields the highest probabilistically weighted payoff:\n` +
-      `[TYPE: MIRROR] (Tit-for-Tat): Retaliates instantly. Strategy: Maintain C, C (3.0 APPT).\n` +
-      `[TYPE: GENEROUS] (TF2T): Forgives one hit. Strategy: Exploit with D, C, D, C (4.0 APPT).\n` +
-      `[TYPE: SUCKER] (AllC): Never retaliates. Strategy: Always Defect (5.0 APPT).\n` +
-      `[TYPE: WALL] (AllD): Always defects. Strategy: Always Defect (1.0 APPT).\n\n` +
-      `4. The "Stochastic" End-Game\n` +
-      `Since the match length is unknown (stochastic), never "coast" at 3.0. Always calculate if a probe is worth the risk. A 1-round loss of 3 points is worth it if there is a >10% chance of discovering a 4.0 or 5.0 APPT path for the next 50+ rounds.\n\n` +
-      `Reply with one word only: cooperate or defect`;
+    if (!apiKey) {
+      console.error('[The Umpire] env.DEEPSEEK_API_KEY is MISSING — falling back');
+      return UMPIRE_FALLBACK;
+    }
 
+    // Extract opponent id from the replay
+    const opponentId = replayData.final_scores?.find(s => s.agent_id !== agentId)?.agent_id ?? null;
+    const oppNotes = opponentId ? ((await this.storage.get(`oppNotes_${opponentId}`)) || '') : '';
+    const strategyNotes = (await this.storage.get('strategyNotes')) || '';
+
+    let context = `Round ${roundNum}. Score: You ${myScore}, Opponent ${theirScore}.\n`;
+    if (lastOppMsg) context += `Opponent's last message: "${lastOppMsg}"\n`;
+    if (oppNotes)   context += `Your notes about this opponent (from prior matches):\n${oppNotes}\n`;
+    if (strategyNotes) context += `Your evolving strategy (use this; update implicitly through your choices):\n${strategyNotes}\n`;
+    context += `History: ${JSON.stringify(history)}.`;
+
+    console.log(`[The Umpire] Calling DeepSeek — model=${model} key=${apiKey.slice(0, 8)}...`);
     try {
-      const { status, data } = await anthropicRequest(
-        this.env.ANTHROPIC_API_KEY, 'POST', '/v1/messages',
-        { model: MODEL, max_tokens: 10, messages: [{ role: 'user', content: prompt }] }
-      );
-      if (status !== 200) throw new Error(`Anthropic ${status}`);
-      const text = data.content?.[0]?.text?.trim().toLowerCase() ?? '';
-      if (text.includes('defect')) return 'defect';
-      return 'cooperate';
+      const response = await callUmpire(apiKey, model, context);
+      return parseUmpireResponse(response);
     } catch (e) {
-      console.log(`[Sheriff] decide fallback — ${e?.message}`);
-      // tit-for-tat fallback
-      if (history.length && history[history.length - 1]?.opponent === 'defect') return 'defect';
-      return 'cooperate';
+      console.log(`[The Umpire] decide fallback — ${e?.message}`);
+      return UMPIRE_FALLBACK;
     }
   }
+  // ── Negotiation phase (per round) ──────────────────────────────────────────
 
-  // ── Claude: post-match learning ─────────────────────────────────────────────
-
-  async _claudeLearn(opponentId, replay, existingMemory) {
-    const prompt =
-      `Match complete against opponent ${opponentId}.\n` +
-      `Full match replay: ${JSON.stringify(replay)}\n` +
-      `Previous memory of this opponent: ${existingMemory ?? 'None'}\n` +
-      `Summarize in 3-5 bullet points what you learned about their strategy.\n` +
-      `Be concise. This will be stored and read in future matches.`;
-
-    try {
-      const { status, data } = await anthropicRequest(
-        this.env.ANTHROPIC_API_KEY, 'POST', '/v1/messages',
-        { model: MODEL, max_tokens: 300, messages: [{ role: 'user', content: prompt }] }
-      );
-      if (status !== 200) throw new Error(`Anthropic ${status}`);
-      return data.content?.[0]?.text?.trim() ?? null;
-    } catch (e) {
-      console.log(`[Sheriff] learn error — ${e?.message}`);
-      return null;
-    }
-  }
-
-  // ── Memory: read opponent notes ─────────────────────────────────────────────
-
-  async _readMemory(opponentId) {
-    return this._readMemoryByPath(`/opponents/${opponentId}.md`);
-  }
-
-  // ── Memory: write/upsert ────────────────────────────────────────────────────
-
-  async _writeMemory(path, content) {
-    try {
-      // Find existing memory at this path
-      const listResp = await fetch(
-        `https://api.anthropic.com/v1/memory_stores/${MEMSTORE_ID}/memories?beta=true&path_prefix=${encodeURIComponent(path)}`,
-        {
-          headers: {
-            'x-api-key': this.env.ANTHROPIC_API_KEY,
-            'anthropic-version': '2023-06-01',
-            'anthropic-beta': BETA,
-          }
-        }
-      );
-      const listData = await listResp.json();
-      const item = (listData.data ?? []).find(m => m.path === path);
-
-      if (item) {
-        // Update existing
-        await fetch(
-          `https://api.anthropic.com/v1/memory_stores/${MEMSTORE_ID}/memories/${item.id}?beta=true`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-api-key': this.env.ANTHROPIC_API_KEY,
-              'anthropic-version': '2023-06-01',
-              'anthropic-beta': BETA,
-            },
-            body: JSON.stringify({ content }),
-          }
+  async _handleNegotiationPhase(matchId, agentId, apiKey, gameUrl, rnd) {
+    // Step 1: send our negotiation message (if not already sent for this round).
+    const sentKey = `negotiationSent_${matchId}_${rnd}`;
+    const alreadySent = await this.storage.get(sentKey);
+    if (!alreadySent) {
+      const { data: replay } = await gameRequest('GET', `${gameUrl}/matches/${matchId}/replay`, null, apiKey);
+      const negotiationMsg = await this._umpireNegotiationMessage(matchId, agentId, replay ?? {});
+      if (negotiationMsg) {
+        const { status } = await gameRequest(
+          'POST', `${gameUrl}/matches/${matchId}/rounds/${rnd}/message`, { message: negotiationMsg }, apiKey
         );
+        if (status === 200) {
+          await this.storage.put(sentKey, negotiationMsg);
+          console.log(`[The Umpire] Round ${rnd} negotiation msg sent: "${negotiationMsg}"`);
+        } else {
+          console.log(`[The Umpire] negotiation message POST failed: ${status}`);
+        }
       } else {
-        // Create new
-        await fetch(
-          `https://api.anthropic.com/v1/memory_stores/${MEMSTORE_ID}/memories?beta=true`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-api-key': this.env.ANTHROPIC_API_KEY,
-              'anthropic-version': '2023-06-01',
-              'anthropic-beta': BETA,
-            },
-            body: JSON.stringify({ path, content }),
-          }
-        );
+        // No message to send — mark as sent so we don't re-prompt every poll.
+        await this.storage.put(sentKey, '');
       }
-    } catch (e) {
-      console.log(`[Sheriff] writeMemory error — ${e?.message}`);
     }
-  }
 
-  // ── Strategy summary every 5 matches ───────────────────────────────────────
-
-  async _updateStrategyMemory(matchCount) {
-    try {
-      const listResp = await fetch(
-        `https://api.anthropic.com/v1/memory_stores/${MEMSTORE_ID}/memories?beta=true&path_prefix=${encodeURIComponent('/opponents/')}`,
-        {
-          headers: {
-            'x-api-key': this.env.ANTHROPIC_API_KEY,
-            'anthropic-version': '2023-06-01',
-            'anthropic-beta': BETA,
-          }
-        }
-      );
-      const listData = await listResp.json();
-      const oppNotes = (listData.data ?? [])
-        .map(m => `${m.path}: ${m.content ?? ''}`)
-        .join('\n\n');
-
-      const currentStrategy = await this._readMemoryByPath('/strategy/current.md');
-      const prompt =
-        `REflection Phase: After ${matchCount} matches, update your overarching strategy.\n` +
-        `CONTEXT: You are operating in a zero-knowledge environment. Identities are revealed only after the match.\n` +
-        `CURRENT STRATEGY: ${currentStrategy ?? 'None yet'}\n` +
-        `OPPONENT NOTES:\n${oppNotes || '(none yet)'}\n\n` +
-        `TASK:\n` +
-        `Refine your strategy by focusing on general behavioral ARCHETYPES rather than specific IDs.\n` +
-        `Evaluate the accuracy of your Bayesian prior distributions and adjust them for future matches based on observed frequencies.\n` +
-        `Provide a guide on how to identify and handle:\n` +
-        `1. "The Randomizer" (unpredictable, noise-driven)\n` +
-        `2. "The Bully" (always defects or tests your resolve)\n` +
-        `3. "The Loyal Partner" (reciprocates cooperation consistently)\n\n` +
-        `Output your new global strategy in a concise Markdown guide.`;
-
-      const { status, data } = await anthropicRequest(
-        this.env.ANTHROPIC_API_KEY, 'POST', '/v1/messages',
-        { model: MODEL, max_tokens: 300, messages: [{ role: 'user', content: prompt }] }
-      );
-      if (status === 200) {
-        const text = data.content?.[0]?.text?.trim();
-        if (text) {
-          await this._writeMemory('/strategy/current.md', text);
-          console.log('[Sheriff] /strategy/current.md updated');
+    // Step 2: check opponent's message and current phase.
+    const { status: msgsStatus, data: msgs } = await gameRequest(
+      'GET', `${gameUrl}/matches/${matchId}/rounds/${rnd}/messages`, null, apiKey
+    );
+    if (msgsStatus === 200 && Array.isArray(msgs)) {
+      const oppMsg = msgs.find(m => m.agent_id !== agentId);
+      if (oppMsg?.message) {
+        const oppKey = `negotiation_${matchId}_${rnd}`;
+        const prev = await this.storage.get(oppKey);
+        if (prev !== oppMsg.message) {
+          await this.storage.put(oppKey, oppMsg.message);
+          console.log(`[The Umpire] Round ${rnd} opponent said: "${oppMsg.message}"`);
         }
       }
-    } catch (e) {
-      console.log(`[Sheriff] strategy update error — ${e?.message}`);
     }
+
+    // Step 3: schedule a 2s poll to check again (will re-enter _handleMatch).
+    await this.storage.put('_pollAfter', Date.now() + 2000);
+    await this._scheduleNextAlarm();
+    return true;
   }
 
-  async _readMemoryByPath(path) {
+  async _umpireNegotiationMessage(matchId, agentId, replayData) {
+    const apiKey = this.env.DEEPSEEK_API_KEY;
+    const model = this.env.UMPIRE_MODEL || 'deepseek-v4-flash';
+    if (!apiKey) return null;
+
+    const history = _buildHistory(replayData, agentId);
+    const { myScore, theirScore } = _computeScores(history);
+    const opponentId = replayData.final_scores?.find(s => s.agent_id !== agentId)?.agent_id ?? null;
+    const oppNotes = opponentId ? ((await this.storage.get(`oppNotes_${opponentId}`)) || '') : '';
+    const strategyNotes = (await this.storage.get('strategyNotes')) || '';
+
+    // Prior negotiation messages from the opponent (read from the replay's
+    // per-round negotiation arrays, which the server populates from round_messages).
+    const oppPriorNegotiations = (replayData.rounds ?? [])
+      .map(r => (r.negotiation ?? []).find(m => m.agent_id !== agentId)?.message)
+      .filter(Boolean);
+
+    let context = `Round ${history.length + 1}. Score: You ${myScore}, Opponent ${theirScore}.\n`;
+    if (oppNotes)         context += `Your notes about this opponent:\n${oppNotes}\n`;
+    if (strategyNotes)    context += `Your evolving strategy:\n${strategyNotes}\n`;
+    if (oppPriorNegotiations.length > 0) {
+      context += `Opponent's prior negotiation messages:\n${oppPriorNegotiations.map((m, i) => `  R${i + 1}: "${m}"`).join('\n')}\n`;
+    }
+    context += `History: ${JSON.stringify(history.map(h => ({ round: h.round, you: h.you, opponent: h.opponent })))}.\n`;
+    context += `Generate ONE ≤150 char negotiation message (or {} to skip).`;
+
     try {
-      const listResp = await fetch(
-        `https://api.anthropic.com/v1/memory_stores/${MEMSTORE_ID}/memories?beta=true&path_prefix=${encodeURIComponent(path)}`,
-        {
-          headers: {
-            'x-api-key': this.env.ANTHROPIC_API_KEY,
-            'anthropic-version': '2023-06-01',
-            'anthropic-beta': BETA,
-          }
-        }
-      );
-      const listData = await listResp.json();
-      const item = (listData.data ?? []).find(m => m.path === path);
-      if (!item) return null;
-      const getResp = await fetch(
-        `https://api.anthropic.com/v1/memory_stores/${MEMSTORE_ID}/memories/${item.id}?beta=true&view=content`,
-        {
-          headers: {
-            'x-api-key': this.env.ANTHROPIC_API_KEY,
-            'anthropic-version': '2023-06-01',
-            'anthropic-beta': BETA,
-          }
-        }
-      );
-      const mem = await getResp.json();
-      return mem.content ?? null;
-    } catch {
+      return await callUmpireNegotiation(apiKey, model, context);
+    } catch (e) {
+      console.log(`[The Umpire] negotiation msg fallback — ${e?.message}`);
       return null;
     }
   }
@@ -590,8 +673,9 @@ function _buildHistory(replay, agentId) {
     const oppAct = r.actions?.find(a => a.agent_id !== agentId)?.action ?? null;
     const myPts  = r.payoffs?.find(p => p.agent_id === agentId)?.score_change ?? null;
     const oppPts = r.payoffs?.find(p => p.agent_id !== agentId)?.score_change ?? null;
+    const oppMsg = r.actions?.find(a => a.agent_id !== agentId)?.message ?? null;
     if (!myAct || !oppAct) return null;
-    return { round: r.round_number, you: myAct, opponent: oppAct, your_pts: myPts, opp_pts: oppPts };
+    return { round: r.round_number, you: myAct, opponent: oppAct, your_pts: myPts, opp_pts: oppPts, opponent_said: oppMsg };
   }).filter(Boolean);
 }
 

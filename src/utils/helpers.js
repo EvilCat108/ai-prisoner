@@ -1,7 +1,7 @@
 export async function broadcastSSE(env, type, data) {
   try {
-    const doId = env.SHERIFF.idFromName('claude-singleton');
-    const doObj = env.SHERIFF.get(doId);
+    const doId = env.UMPIRE.idFromName('umpire-singleton');
+    const doObj = env.UMPIRE.get(doId);
     await doObj.fetch(new Request('http://do/broadcast', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

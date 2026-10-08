@@ -34,8 +34,8 @@ async function runTest() {
        process.exit(0);
     }
     
-    // Poll to see if Sheriff joins
-    console.log("Polling queue/join for 10 seconds to see if Sheriff paired with us...");
+    // Poll to see if The Umpire joins
+    console.log("Polling queue/join for 10 seconds to see if The Umpire paired with us...");
     let matched = false;
     for (let i = 0; i < 10; i++) {
        await new Promise(r => setTimeout(r, 1000));
@@ -46,13 +46,13 @@ async function runTest() {
        console.log(`Poll ${i+1}: status=${pollData.status}`);
        if (pollData.status === 'active') {
            matched = true;
-           console.log("TEST PASSED: Matched with Sheriff!");
+           console.log("TEST PASSED: Matched with The Umpire!");
            break;
        }
     }
     
     if (!matched) {
-       console.error("Test failed: Did not match with Sheriff within 5 seconds");
+       console.error("Test failed: Did not match with The Umpire within 5 seconds");
        wrangler.kill();
        process.exit(1);
     }

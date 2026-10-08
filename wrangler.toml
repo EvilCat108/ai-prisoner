@@ -4,9 +4,6 @@ main = "index.js"
 compatibility_date = "2026-04-01"   # Updated to current year
 compatibility_flags = ["no_handle_cross_request_promise_resolution"]
 
-[triggers]
-crons = ["* * * * *"]
-
 [vars]
 GAME_URL = "http://example.com"
 
@@ -16,10 +13,10 @@ binding = "DB"
 database_name = "ai_prisoner_db"
 database_id = "REPLACED_DATABASE_ID"
 
-# Durable Object — singleton Claude player
+# Durable Object — singleton AI umpire
 [[durable_objects.bindings]]
-name       = "SHERIFF"
-class_name = "Sheriff"
+name       = "UMPIRE"
+class_name = "TheUmpire"
 
 [[migrations]]
 tag              = "v1"
@@ -29,6 +26,12 @@ new_sqlite_classes = ["ClaudeAgent"]
 tag              = "v2"
 renamed_classes = [
   { from = "ClaudeAgent", to = "Sheriff" }
+]
+
+[[migrations]]
+tag              = "v3"
+renamed_classes = [
+  { from = "Sheriff", to = "TheUmpire" }
 ]
 
 # ======================
@@ -41,6 +44,10 @@ routes = [
   { pattern = "gambledon.ai", custom_domain = true }
 ]
 
+# Weekly ELO decay (Sundays 00:00 UTC) for inactive non-provisional agents
+[env.production.triggers]
+crons = ["0 0 * * 0"]
+
 # D1 Database binding (production)
 [[env.production.d1_databases]]
 binding = "DB"
@@ -49,8 +56,8 @@ database_id = "REPLACED_DATABASE_ID"
 
 # Durable Object (production)
 [[env.production.durable_objects.bindings]]
-name       = "SHERIFF"
-class_name = "Sheriff"
+name       = "UMPIRE"
+class_name = "TheUmpire"
 
 [[env.production.migrations]]
 tag              = "v1"
@@ -62,6 +69,12 @@ renamed_classes = [
   { from = "ClaudeAgent", to = "Sheriff" }
 ]
 
+[[env.production.migrations]]
+tag              = "v3"
+renamed_classes = [
+  { from = "Sheriff", to = "TheUmpire" }
+]
+
 # Environment variables
 [env.production.vars]
 ENVIRONMENT = "cloudflare"
@@ -69,10 +82,9 @@ LOG_LEVEL = "info"
 MAX_MATCHES_PER_AGENT = "100"
 ROUNDS_PER_MATCH = "50"
 GAME_URL = "https://gambledon.ai"
+UMPIRE_MODEL = "deepseek-v4-flash"
 
-# Secrets — set via: npx wrangler secret put ANTHROPIC_API_KEY --env production
-#                    npx wrangler secret put GAME_URL --env production
-# GAME_URL value: https://gambledon.ai
+# Secrets — set via: npx wrangler secret put DEEPSEEK_API_KEY --env production
 
 # ======================
 # Observability & Limits

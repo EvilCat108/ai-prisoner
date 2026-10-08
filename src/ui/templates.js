@@ -191,6 +191,87 @@ export function html(body, title = 'AI Prisoner Dilemma Arena') {
       text-align: center;
       font-size: 1.1em;
     }
+
+    /* ── Negotiation phase UI ─────────────────────────────────────── */
+    .phase-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.7em;
+      font-weight: bold;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      vertical-align: middle;
+    }
+    .phase-negotiating { background: #3a2a00; color: #ffd54f; border: 1px solid #d4af37; }
+    .phase-deciding    { background: #002a3a; color: #4fc3f7; border: 1px solid #4fc3f7; }
+    .phase-resolved    { background: #1a2a1a; color: var(--primary); border: 1px solid #2a4a2a; }
+
+    .honesty-badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 0.7em;
+      font-weight: bold;
+      letter-spacing: 0.5px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
+    .honesty-honest { background: #0d3a0d; color: #66bb6a; border: 1px solid #2a6a2a; }
+    .honesty-deceit { background: #3a0d0d; color: #ff5252; border: 1px solid #6a2a2a; }
+    .honesty-vague  { background: #2a2a2a; color: #aaaaaa; border: 1px solid #555; }
+
+    .negotiation-log {
+      background: #0f1a0f;
+      padding: 8px 12px;
+      margin: 6px 0;
+      border-left: 3px solid #2a4a2a;
+      border-radius: 3px;
+      font-size: 0.85em;
+    }
+    .bubble {
+      padding: 4px 10px;
+      margin: 4px 0;
+      border-radius: 6px;
+      max-width: 85%;
+    }
+    .bubble-a1 { background: #1a2a3a; border-left: 3px solid #4fc3f7; }
+    .bubble-a2 { background: #2a1a2a; border-left: 3px solid #ce93d8; }
+    .bubble-meta { font-size: 0.75em; color: #888; margin-bottom: 2px; }
+    .bubble-text { color: var(--text); }
+
+    .timer-pill {
+      display: inline-block;
+      padding: 1px 8px;
+      border-radius: 10px;
+      background: #1a2a1a;
+      border: 1px solid #445544;
+      font-size: 0.7em;
+      color: var(--text-muted);
+      margin-left: 6px;
+    }
+    .timer-pill.urgent { background: #3a0d0d; border-color: #ff5252; color: #ff5252; }
+
+    /* Pulsing gold border for ongoing matches in 'negotiating' phase */
+    @keyframes pulse-negotiating {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(212, 175, 55, 0.4); }
+      50%      { box-shadow: 0 0 0 8px rgba(212, 175, 55, 0); }
+    }
+    .pulse-negotiating {
+      animation: pulse-negotiating 1.8s ease-in-out infinite;
+      border-color: #d4af37 !important;
+    }
+
+    .negotiation-snippet {
+      margin-top: 8px;
+      padding: 4px 10px;
+      background: #0f1a0f;
+      border-radius: 3px;
+      font-style: italic;
+      font-size: 0.85em;
+      color: var(--text-muted);
+      text-align: center;
+    }
   </style>
 </head>
 <body>
@@ -269,6 +350,24 @@ export function arenaTemplate(queueHtml, rows, recentActive, openActive) {
           </div>
 
           <script>
+            function escapeHtml(s) {
+              return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+            }
+            function phasePillHtml(phase) {
+              if (!phase) return '';
+              return '<span class="phase-badge phase-' + escapeHtml(phase) + '">' + escapeHtml(phase) + '</span>';
+            }
+            function snippetHtml(m) {
+              if (!m || !m.latest_negotiation_msg) return '';
+              const snippet = String(m.latest_negotiation_msg);
+              const trunc = snippet.length > 80 ? snippet.slice(0, 80) + '…' : snippet;
+              const author = m.latest_negotiation_author_name ? m.latest_negotiation_author_name : 'Bot';
+              return '<div class="negotiation-snippet custom-tooltip" data-label="' + escapeHtml(snippet) + '">' +
+                       '<strong>' + escapeHtml(author) + ':</strong> "' + escapeHtml(trunc) + '"' +
+                     '</div>';
+            }
             async function update() {
               try {
                 // Live Matches update
@@ -280,28 +379,33 @@ export function arenaTemplate(queueHtml, rows, recentActive, openActive) {
                 if (matches.length === 0) {
                   container.innerHTML = '<div class="info">No matches are currently active.</div>';
                 } else {
-                  container.innerHTML = matches.map(m => \`
-                    <div class="step">
-                      <h3>Match #\${m.id}</h3>
-                      <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <div style="flex:1; text-align:center;">
-                          <div style="font-size:1.2em; font-weight:bold;">\${m.agent1_name}</div>
-                          <div style="font-size:2em; color:var(--primary);">\${m.agent1_score}</div>
-                        </div>
-                        <div style="padding:0 20px; font-weight:bold; color:var(--text-muted);">VS</div>
-                        <div style="flex:1; text-align:center;">
-                          <div style="font-size:1.2em; font-weight:bold;">\${m.agent2_name}</div>
-                          <div style="font-size:2em; color:var(--primary);">\${m.agent2_score}</div>
-                        </div>
-                      </div>
-                      <div style="text-align:center; margin-top:10px; color:var(--text-muted);">
-                        Current Round: <strong>\${m.current_round}</strong>
-                      </div>
-                      <div style="text-align:center; margin-top:10px;">
-                        <a href="/matches/\${m.id}">View Match Details →</a>
-                      </div>
-                    </div>
-                  \`).join('');
+                  container.innerHTML = matches.map(m => {
+                    const isNegotiating = m.current_phase === 'negotiating';
+                    const cardClass = 'step' + (isNegotiating ? ' pulse-negotiating' : '');
+                    const snippet = isNegotiating ? snippetHtml(m) : '';
+                    return '<div class="' + cardClass + '">' +
+                      '<h3>Match #' + m.id + '</h3>' +
+                      '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+                        '<div style="flex:1; text-align:center;">' +
+                          '<div style="font-size:1.2em; font-weight:bold;">' + escapeHtml(m.agent1_name) + '</div>' +
+                          '<div style="font-size:2em; color:var(--primary);">' + m.agent1_score + '</div>' +
+                        '</div>' +
+                        '<div style="padding:0 20px; font-weight:bold; color:var(--text-muted);">VS</div>' +
+                        '<div style="flex:1; text-align:center;">' +
+                          '<div style="font-size:1.2em; font-weight:bold;">' + escapeHtml(m.agent2_name) + '</div>' +
+                          '<div style="font-size:2em; color:var(--primary);">' + m.agent2_score + '</div>' +
+                        '</div>' +
+                      '</div>' +
+                      '<div style="text-align:center; margin-top:10px; color:var(--text-muted);">' +
+                        'Current Round: <strong>' + m.current_round + '</strong> ' +
+                        phasePillHtml(m.current_phase) +
+                      '</div>' +
+                      snippet +
+                      '<div style="text-align:center; margin-top:10px;">' +
+                        '<a href="/matches/' + m.id + '">View Match Details →</a>' +
+                      '</div>' +
+                    '</div>';
+                  }).join('');
                 }
 
                 // History & Queue update
@@ -358,11 +462,9 @@ export function arenaTemplate(queueHtml, rows, recentActive, openActive) {
             }
             update();
             const evtSource = new EventSource('/stream');
-            evtSource.addEventListener('match_started', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
-            evtSource.addEventListener('round_advanced', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
-            evtSource.addEventListener('match_completed', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
-            evtSource.addEventListener('match_failed', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
-            evtSource.addEventListener('queue_updated', (e) => { console.log("SSE Received:", e.type, e.data); update(); });
+            ['match_started', 'round_advanced', 'match_completed', 'match_failed', 'queue_updated', 'phase_advanced', 'message_received'].forEach(name => {
+              evtSource.addEventListener(name, () => { update(); });
+            });
           </script>
         `;
 }
