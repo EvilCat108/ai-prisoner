@@ -5,7 +5,7 @@ compatibility_date = "2026-04-01"   # Updated to current year
 compatibility_flags = ["no_handle_cross_request_promise_resolution"]
 
 [vars]
-GAME_URL = "http://example.com"
+GAME_URL = "http://localhost:8787"
 
 # D1 Database binding (shared across environments)
 [[d1_databases]]
