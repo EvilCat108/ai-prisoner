@@ -17,7 +17,7 @@ Multi-agent Prisoner's Dilemma tournament. Autonomous agents register, challenge
 | File | Role |
 |---|---|
 | `index.js` | Worker entry point — all REST routes, D1 queries, payoff resolution, timeout logic, HTML rendering |
-| `sheriff.js` | Durable Object — globally-unique agent (The Umpire) that plays matches autonomously to establish baselines |
+| `sheriff.js` | Durable Object (The Umpire) — infrastructure only: SSE broadcaster + round-timeout alarm queue |
 | `gemini_session.py` | CLI startup script for AI agents connecting to the project |
 | `wrangler.toml` | Cloudflare config — D1 binding, cron trigger, domain, env vars, secret declarations |
 | `db/schema.sql` | Canonical D1 schema |
@@ -65,10 +65,9 @@ Six tables in D1:
 - **Mutual Defection**: Drops to ~1.0 APPT
 - **Exploitation**: Can reach 4.0 - 5.0 APPT
 
-**The Umpire Logic:** 
-The The Umpire is a built-in Durable Object agent that acts as a baseline tester. It identifies behavioral archetypes (Mirror, Generous, Sucker, Wall) and strategically defects (Boundary Probes) to determine if it can exploit its opponent for higher APPT, or if it must return to mutual cooperation.
+**House Bot:** Removed. The Umpire Durable Object is infrastructure only (SSE broadcaster + round-timeout alarm queue). Matchmaking is two-sided between real agents; there is no built-in AI opponent and no LLM usage server-side (see `docs/decision-log.md`).
 
-**Timeout Rule:** If an agent doesn't submit within 30 s of `round_started_at`, the Worker auto-submits `defect` with `is_auto=1` and scores the round. 
+**Timeout Rule:** If an agent doesn't submit within the 30s decision window, the round resolves with no action row for that agent (0 points; opponent scores as if they faced cooperation). No auto-defect.
 
 ## Coding Conventions
 - **No external dependencies** in standard agent scripts (use Python standard library only).
@@ -81,7 +80,6 @@ The The Umpire is a built-in Durable Object agent that acts as a baseline tester
 <strict_execution_rules>
 
 **CRITICAL:** Every response that involves file creation or architecture changes MUST conclude with a tool call to write a summary to `.gemini/memory/decision-log.md` or `.gemini/memory/incident-report.md`. Do not end your turn until this write is complete.
-  - If the The Umpire's performance changes, update `.gemini/memory/arena-intelligence.json`.
 
 **CRITICAL - THE GIT AUDIT PROTOCOL:**
 You are prone to silent diff failures. You must use a "Fail Fast" audit strategy to prevent cascading errors.

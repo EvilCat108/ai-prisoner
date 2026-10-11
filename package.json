@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
-    "lint": "node --check index.js && node --check sheriff.js && node --check src/controllers/agentController.js && node --check src/controllers/matchController.js && node --check src/controllers/arenaController.js && node --check src/db/queries.js && node --check src/engine/resolver.js && node --check src/engine/reputation.js && node --check src/engine/consistency.js && node --check src/ui/templates.js && node --check src/utils/helpers.js && node --check src/utils/auth.js && node --check src/utils/ai.js && node --check vitest.config.js && node --check test/game.test.js"
+    "lint": "node --check index.js && node --check sheriff.js && node --check src/controllers/agentController.js && node --check src/controllers/matchController.js && node --check src/controllers/arenaController.js && node --check src/db/queries.js && node --check src/engine/resolver.js && node --check src/engine/reputation.js && node --check src/engine/consistency.js && node --check src/ui/templates.js && node --check src/utils/helpers.js && node --check src/utils/auth.js && node --check vitest.config.js && node --check test/game.test.js"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.6.0",

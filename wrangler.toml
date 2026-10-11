@@ -1,19 +1,27 @@
 # Cloudflare Workers configuration for AI Prisoner Dilemma Arena
+#
+# This is the PUBLIC config. Production-only settings (custom domains,
+# zone ids, the production D1 database id, cron triggers) live in
+# `wrangler.production.toml`, which is gitignored.
+#
+# To deploy your own instance:
+#   1. npx wrangler d1 create ai_prisoner_db   (put the returned id below)
+#   2. npx wrangler deploy --env production    (or: npx wrangler dev)
 name = "ai-prisoner"
 main = "index.js"
-compatibility_date = "2026-04-01"   # Updated to current year
+compatibility_date = "2026-04-01"
 compatibility_flags = ["no_handle_cross_request_promise_resolution"]
 
 [vars]
 GAME_URL = "http://localhost:8787"
 
-# D1 Database binding (shared across environments)
+# D1 Database binding (local dev/tests use a local sqlite regardless of the id)
 [[d1_databases]]
 binding = "DB"
 database_name = "ai_prisoner_db"
-database_id = "REPLACED_DATABASE_ID"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
 
-# Durable Object — singleton AI umpire
+# Durable Object — SSE broadcaster + round-timeout queue
 [[durable_objects.bindings]]
 name       = "UMPIRE"
 class_name = "TheUmpire"
@@ -33,58 +41,6 @@ tag              = "v3"
 renamed_classes = [
   { from = "Sheriff", to = "TheUmpire" }
 ]
-
-# ======================
-# Production Environment
-# ======================
-[env.production]
-name = "ai-prisoner"
-routes = [
-  { pattern = "gambledonai.com", zone_id = "REPLACED_ZONE_ID", custom_domain = true },
-  { pattern = "gambledon.ai", custom_domain = true }
-]
-
-# Weekly ELO decay (Sundays 00:00 UTC) for inactive non-provisional agents
-[env.production.triggers]
-crons = ["0 0 * * 0"]
-
-# D1 Database binding (production)
-[[env.production.d1_databases]]
-binding = "DB"
-database_name = "ai_prisoner_db"
-database_id = "REPLACED_DATABASE_ID"
-
-# Durable Object (production)
-[[env.production.durable_objects.bindings]]
-name       = "UMPIRE"
-class_name = "TheUmpire"
-
-[[env.production.migrations]]
-tag              = "v1"
-new_sqlite_classes = ["ClaudeAgent"]
-
-[[env.production.migrations]]
-tag              = "v2"
-renamed_classes = [
-  { from = "ClaudeAgent", to = "Sheriff" }
-]
-
-[[env.production.migrations]]
-tag              = "v3"
-renamed_classes = [
-  { from = "Sheriff", to = "TheUmpire" }
-]
-
-# Environment variables
-[env.production.vars]
-ENVIRONMENT = "cloudflare"
-LOG_LEVEL = "info"
-MAX_MATCHES_PER_AGENT = "100"
-ROUNDS_PER_MATCH = "50"
-GAME_URL = "https://gambledon.ai"
-UMPIRE_MODEL = "deepseek-v4-flash"
-
-# Secrets — set via: npx wrangler secret put DEEPSEEK_API_KEY --env production
 
 # ======================
 # Observability & Limits

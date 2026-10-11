@@ -26,13 +26,6 @@ export async function handleRegisterAgent(request, env, db) {
     return json({ agent, api_key: apiKey });
   } catch (e) {
     if (e.message && e.message.includes('UNIQUE')) {
-      if (name === 'The Umpire') {
-        await db.prepare('UPDATE agents SET api_key_hash = ?, is_active = 1 WHERE name = ?').bind(hash, 'The Umpire').run();
-        const agent = await db.prepare('SELECT id, name, is_active, created_at FROM agents WHERE name = ?').bind('The Umpire').first();
-        await db.prepare('INSERT OR IGNORE INTO agent_stats (agent_id) VALUES (?)').bind(agent.id).run();
-        await logToDb(db, 'INFO', `The Umpire DO re-registered (recovered): ${name} (id: ${agent.id})`);
-        return json({ agent, api_key: apiKey });
-      }
       return err('Agent name already taken', 409);
     }
     throw e;
@@ -66,17 +59,8 @@ export async function handleQueueJoin(request, env, db) {
     return json({ match_id: existingMatch.id, status: 'active' });
   }
 
-  const umpireRecord = await db.prepare("SELECT id FROM agents WHERE name = 'The Umpire'").first();
-  const umpireId = umpireRecord ? umpireRecord.id : null;
-
   await db.prepare('INSERT OR IGNORE INTO match_queue (agent_id) VALUES (?)').bind(agent.id).run();
   await broadcastSSE(env, 'queue_updated', { agent_id: agent.id });
-
-  if (agent.id !== umpireId) {
-    const doId = env.UMPIRE.idFromName('umpire-singleton');
-    const doObj = env.UMPIRE.get(doId);
-    doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error);
-  }
 
   const meRow = await db.prepare('SELECT id, elo, is_provisional FROM agents WHERE id = ?').bind(agent.id).first();
   const myElo = meRow?.elo ?? 1000;
@@ -88,7 +72,7 @@ export async function handleQueueJoin(request, env, db) {
       WHERE ((agent1_id = ? AND agent2_id = ?) OR (agent1_id = ? AND agent2_id = ?))
       ORDER BY created_at DESC LIMIT 3
     `).bind(agent.id, otherId, otherId, agent.id).all();
-    return agent.id === umpireId || otherId === umpireId || (recent.results || []).length === 0;
+    return (recent.results || []).length === 0;
   };
 
   const tryCreateMatch = async (otherId) => {
@@ -122,14 +106,10 @@ export async function handleQueueJoin(request, env, db) {
   };
 
   // Pass 1 — strict band: provisional↔provisional, non-provisional within ±150 ELO.
-  // The Umpire is always a candidate (legacy behavior: idle-tolerant matchmaker).
-  // Other candidates must also have last_seen ≤ 15s.
+  // Candidates must also have last_seen ≤ 15s.
   const strictWhere = `
     mq.agent_id != ?
-      AND (
-        (julianday('now') - julianday(a.last_seen_at)) * 86400 <= 15
-        OR a.name = 'The Umpire'
-      )
+      AND (julianday('now') - julianday(a.last_seen_at)) * 86400 <= 15
       AND (
         (? = 1 AND a.is_provisional = 1)
         OR
@@ -155,10 +135,7 @@ export async function handleQueueJoin(request, env, db) {
   const expandedWhere = `
     mq.agent_id != ?
       AND (julianday('now') - julianday(mq.entered_at)) * 86400 > 60
-      AND (
-        (julianday('now') - julianday(a.last_seen_at)) * 86400 <= 15
-        OR a.name = 'The Umpire'
-      )
+      AND (julianday('now') - julianday(a.last_seen_at)) * 86400 <= 15
       AND (
         (? = 1 AND a.is_provisional = 1)
         OR
@@ -179,17 +156,5 @@ export async function handleQueueJoin(request, env, db) {
     if (resp) return resp;
   }
 
-  return json({ message: 'Added to queue', status: 'queued' });
-}
-
-export async function handleWakeUmpire(env) {
-  const id  = env.UMPIRE.idFromName('umpire-singleton');
-  const obj = env.UMPIRE.get(id);
-  return obj.fetch(new Request('http://do/wake', { method: 'POST' }));
-}
-
-export async function handleAgentStatus(env) {
-  const id  = env.UMPIRE.idFromName('umpire-singleton');
-  const obj = env.UMPIRE.get(id);
-  return obj.fetch(new Request('http://do/status', { method: 'GET' }));
+    return json({ message: 'Added to queue', status: 'queued' });
 }

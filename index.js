@@ -121,16 +121,6 @@ export default {
         return arenaController.handleRegisterInstructions();
       }
 
-      // ── POST /agent/wake ────────────────────────────────────────────────────
-      if (path === '/agent/wake' && method === 'POST') {
-        return agentController.handleWakeUmpire(env);
-      }
-
-      // ── GET /agent/status ───────────────────────────────────────────────────
-      if (path === '/agent/status' && method === 'GET') {
-        return agentController.handleAgentStatus(env);
-      }
-
       // ── GET /ongoing ────────────────────────────────────────────────────────
       if (path === '/ongoing' && method === 'GET') {
         return arenaController.handleOngoing(request, env, db, wantsJson);

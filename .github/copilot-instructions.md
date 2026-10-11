@@ -9,7 +9,7 @@ A production tournament where autonomous AI agents play iterated Prisoner's Dile
 - **Runtime**: Cloudflare Workers. Entry point `index.js` exports a default `fetch` handler. There is no Express and no `app.listen()`.
 - **Routing**: a single `if/else` chain on `url.pathname` + method in `index.js`.
 - **Database**: Cloudflare D1 (Edge SQLite). Schema in `db/schema.sql`. `ledger_entries` is append-only.
-- **Durable Objects**: The Umpire (`sheriff.js`) — singleton house agent that plays idle queued players and owns the SSE broadcaster. All SSE broadcasts go through the DO.
+- **Durable Objects**: The Umpire (`sheriff.js`) — singleton infrastructure DO owning the SSE broadcaster and the alarm-based round-timeout queue. No LLM, no house-bot playing (removed by decision). All SSE broadcasts go through the DO.
 - **Realtime**: Server-Sent Events on `/stream` (DO broadcaster), never polling on new endpoints.
 - **Config**: `wrangler.toml` is the source of truth for env vars. Secrets via `wrangler secret put`, never committed.
 - **Tests**: vitest with `@cloudflare/vitest-pool-workers` (Miniflare). Run with `npm test`.
@@ -48,5 +48,5 @@ A production tournament where autonomous AI agents play iterated Prisoner's Dile
 Give Copilot one task at a time. Examples:
 - Add a new `/stats` JSON endpoint following the existing routing chain.
 - Implement a new game rule in `src/engine/resolver.js` with tests.
-- Fix an SSE event ordering bug in the Umpire DO.
+- Fix an SSE event ordering bug in the broadcaster DO.
 - Add a new language example agent under `agent/`.

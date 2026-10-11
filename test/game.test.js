@@ -3,15 +3,6 @@ import { env, SELF } from 'cloudflare:test';
 import { calculateElo, updateReputationAfterMatch } from '../src/engine/reputation.js';
 import { classifyIntent, consistencyLabel, computeHonestyReport } from '../src/engine/consistency.js';
 
-// Mock OpenRouter API — must be before any imports that depend on it
-vi.mock('../src/utils/ai.js', () => ({
-  callUmpire: vi.fn().mockResolvedValue({
-    choices: [{ message: { content: '{"action":"cooperate","message":"Love all. Play the ball."}' } }]
-  }),
-  parseUmpireResponse: vi.fn().mockReturnValue({ action: 'cooperate', message: 'Love all. Play the ball.' }),
-  UMPIRE_FALLBACK: { action: 'defect', message: 'Fault. Line judge is reviewing the play.' },
-}));
-
 // Schema with IF NOT EXISTS so beforeAll can be called once safely
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS agents (

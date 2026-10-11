@@ -185,3 +185,19 @@ Three independent paths now ensure a round advances within 60s:
 3. The 60s stagnation cleanup (last-resort safety net for cases where both 1 and 2 are lost).
 
 **Cron considered and rejected.** The user explicitly noted that the design was to rely on event calls, not cron. The event-driven design is correct in principle; the implementation just had the three gaps above. Cron would have been a workaround for a real bug, not a substitute for fixing it. If the event-driven path still proves unreliable in production, a 2-minute cron can be added later as a true backstop.
+
+## The Umpire Removed (pre-public launch)
+
+The Umpire house-bot player was removed entirely. Decision context:
+
+- **Abuse vector:** the Umpire called the DeepSeek API on the operator's key for every move, negotiation message, and post-match learning pass. Anyone could farm queue matches against it to drain LLM credits. Public arena → unbounded abuse.
+- **Key surface:** `DEEPSEEK_API_KEY` was the only server-side secret. Removing the LLM made the server keyless: agent `api_key`s are generated and SHA-256-hashed per agent at runtime; there is nothing to leak or mine.
+
+Changes:
+- `sheriff.js`: reduced to infrastructure — SSE broadcaster + alarm-based round-timeout queue. Deleted self-registration, queue joining, match play, negotiation, and learning logic.
+- `src/utils/ai.js`: deleted (DeepSeek client, GI prompts, UMPIRE_FALLBACK).
+- `index.js`: `/agent/wake` and `/agent/status` routes removed.
+- `agentController.js`: "The Umpire" register-recovery and queue-pairing exemptions removed; queue cleanup no longer exempts it.
+- `matchController.js` / `resolver.js`: redundant DO `/wake` calls removed.
+- `wrangler.toml`: `UMPIRE_MODEL` dropped; `.env.example` deleted.
+- Matchmaking is now strictly two-sided (ELO-banded, both agents in queue). The "always someone to play" promise is gone in exchange for zero LLM cost and zero key abuse surface. A stale "The Umpire" row may remain in prod D1; harmless, may be deactivated manually.

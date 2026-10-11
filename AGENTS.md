@@ -14,7 +14,6 @@ This is a **Cloudflare Workers** project. The entry point `index.js` exports a d
 npm test                    # vitest run (cloudflare:test env, 30s timeout)
 npm run lint                # syntax-check every JS file (node --check, ESM)
 npx wrangler deploy --env production   # deploy to prod
-npx wrangler secret put DEEPSEEK_API_KEY --env production   # set Umpire LLM key
 ```
 
 ## Authoritative config
@@ -25,7 +24,7 @@ npx wrangler secret put DEEPSEEK_API_KEY --env production   # set Umpire LLM key
 
 ```
 index.js              # Worker fetch handler — all REST routes, HTML rendering, auth
-sheriff.js            # Durable Object — autonomous AI agent (The Umpire) that plays baseline matches
+sheriff.js            # Durable Object — SSE broadcaster + round-timeout alarm queue
 src/
   db/queries.js       # DB query helpers
   engine/resolver.js  # Payoff calc + timeout resolution + 3-strike forfeit
@@ -37,7 +36,7 @@ agent/play.py         # Single Python client (adaptive GI; see Python agents bel
 
 ## API routing (no framework)
 
-All routes live in `index.js:292` — a giant `if/else` chain on `url.pathname` + `method`. Adding a new route means finding the right spot in this chain. `/stream` delegates to the The Umpire Durable Object.
+All routes live in `index.js:292` — a giant `if/else` chain on `url.pathname` + `method`. Adding a new route means finding the right spot in this chain. `/stream` delegates to the The Umpire Durable Object (broadcaster).
 
 ## Content-type negotiation (Vary header)
 
@@ -49,7 +48,7 @@ The `/ongoing` page fetches data via `/ongoing?format=json` for this reason.
 
 ## Durable Objects
 
-- **The Umpire** (`sheriff.js`): A singleton DO accessed via `env.UMPIRE.idFromName('umpire-singleton')`. It autonomously plays matches using OpenRouter API as a baseline agent. Uses alarm-based polling to hibernate between rounds.
+- **The Umpire** (`sheriff.js`): A singleton DO accessed via `env.UMPIRE.idFromName('umpire-singleton')`. Infrastructure only: owns the SSE broadcaster sessions and the alarm-based round-timeout queue. The original house-bot player (LLM agent) was removed — see decision log.
 - DO bindings are configured in `wrangler.toml` under `[[durable_objects.bindings]]`.
 - All SSE broadcasting goes through the The Umpire DO: `doObj.fetch(new Request('http://do/broadcast', ...))`
 
@@ -117,11 +116,11 @@ State files (`agent/runs/state*.json`) are per-agent persistent state — tracke
 
 ## Architectural Memory
 
-**Before proposing new dependencies, database changes, or major architectural shifts, you MUST read `docs/decision-log.md`** to align with past project decisions. Key decisions include: why Cloudflare Workers over a VPS, why D1 over Postgres, why SSE over WebSockets, the Durable Object broadcaster evolution, and the Bayesian optimization strategy for the The Umpire agent.
+**Before proposing new dependencies, database changes, or major architectural shifts, you MUST read `docs/decision-log.md`** to align with past project decisions. Key decisions include: why Cloudflare Workers over a VPS, why D1 over Postgres, why SSE over WebSockets, the Durable Object broadcaster evolution, the Umpire agent removal, and the SSE broadcaster evolution.
 
 ## Deeper docs
 
-- `GEMINI.md` — full project brain: architecture, rules, The Umpire strategy, behavioral protocols
+- `GEMINI.md` — full project brain: architecture, rules, behavioral protocols
 - `.opencode/skills/` — specialized skill files: DO rules, agent persona, styling tokens, security/auth, SSE blueprint
 - `docs/decision-log.md` — chronological log of all major architectural decisions and resolved incidents
 - `.github/copilot-instructions.md` — MVP design intent (note: predates the Cloudflare Workers deployment)

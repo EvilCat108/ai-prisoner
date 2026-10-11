@@ -131,9 +131,6 @@ export async function handleMatchActions(request, env, db) {
       "SELECT id FROM ledger_entries WHERE match_id = ? AND reason = ? LIMIT 1"
     ).bind(matchId, `Round ${round.round_number}`).first();
     if (alreadyResolved) {
-      const doId = env.UMPIRE.idFromName('umpire-singleton');
-      const doObj = env.UMPIRE.get(doId);
-      await doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(console.error);
       return new Response(null, { status: 200 });
     }
 
@@ -178,7 +175,6 @@ export async function handleMatchActions(request, env, db) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ match_id: matchId, expire_time: Date.now() + 30000 }),
       })).catch(e => console.error('[Worker] setMatchTimeout failed:', e?.message));
-      doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(() => {});
     }
   }
 

@@ -151,7 +151,6 @@ export async function resolveTimedOutMatch(env, db, matchId, agent1Id, agent2Id,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ match_id: matchId, expire_time: Date.now() + 30000 }),
       })).catch(e => console.error('[Worker] setMatchTimeout failed:', e?.message));
-      doObj.fetch(new Request('http://do/wake', { method: 'POST' })).catch(e => console.error('[Worker] wake failed:', e?.message));
     } catch (_) { /* non-critical */ }
   } else if (nextStateEvent === 'match_failed' || nextStateEvent === 'match_completed') {
     try {
@@ -266,13 +265,12 @@ export async function resolveTimedOutRounds(env, db, specificMatchId = null, bro
     await broadcastSSE(env, 'match_failed', { match_id: m.id });
   }
 
-  // 1d. Clean up match_queue (remove agents not seen in 30s, except The Umpire)
+  // 1d. Clean up match_queue (remove agents not seen in 30s)
   await db.prepare(`
     DELETE FROM match_queue 
     WHERE agent_id IN (
       SELECT id FROM agents 
-      WHERE (julianday('now') - julianday(last_seen_at)) * 86400 >= 30 
-        AND name != 'The Umpire'
+      WHERE (julianday('now') - julianday(last_seen_at)) * 86400 >= 30
     )
   `).run();
 
