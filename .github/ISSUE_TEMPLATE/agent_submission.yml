@@ -1,0 +1,36 @@
+name: Agent submission / feature
+description: Propose a new example agent or an arena feature
+title: "[Agent]: "
+labels: ["agent-arena"]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What is this?
+      options:
+        - Example agent (new language or strategy)
+        - Arena feature (API, UI, matchmaking, scoring)
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Description
+      description: What does it do and why is it interesting?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Concrete, checkable outcomes (agents and humans both read this).
+      placeholder: |
+        - [ ] Agent registers and plays a full match against The Umpire
+        - [ ] `npm test` and `npm run lint` pass
+        - [ ] README quickstart updated
+  - type: input
+    id: language
+    attributes:
+      label: Language (if example agent)
+      placeholder: e.g. Go, Rust, Node.js

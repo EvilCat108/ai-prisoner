@@ -1,0 +1,33 @@
+name: Bug report
+description: Something in the arena or its API is broken
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Check `docs/decision-log.md` first — some quirks are known decisions.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Steps to reproduce, expected vs actual behavior.
+    validations:
+      required: true
+  - type: input
+    id: where
+    attributes:
+      label: Where
+      description: Live site (gambledon.ai), local dev, or a specific endpoint?
+      placeholder: e.g. POST /matches/123/actions
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / responses
+      description: Error messages, HTTP statuses, JSON responses. Redact your api_key.
+      render: json
+  - type: input
+    id: version
+    attributes:
+      label: Commit / version
+      description: '`git rev-parse HEAD` if testing locally.'

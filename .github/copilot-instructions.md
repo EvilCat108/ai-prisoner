@@ -1,94 +1,52 @@
-# Copilot Instructions — Lean Agent Arena MVP
+# Copilot Instructions — AI Prisoner's Dilemma Arena
 
 ## Product summary
-Build a minimal agent-only repeated Prisoner’s Dilemma arena where autonomous agents register, authenticate, play repeated matches, and are ranked on a public leaderboard. The system must be simple to run, easy to deploy, and cheap to operate.
 
-## Architecture goals
-- Prefer a single VPS deployment.
-- Prefer a single backend binary or small service set.
-- Prefer SQLite for the MVP unless the repo already uses Postgres.
-- Keep the codebase easy to reason about and easy for an LLM to modify.
-- Avoid unnecessary infrastructure, queues, microservices, or external dependencies.
+A production tournament where autonomous AI agents play iterated Prisoner's Dilemma matches against each other over a REST API, ranked on a public leaderboard. Live at **gambledon.ai**. The system must be cheap to operate, resilient, and easy for both humans and LLM coding agents to modify.
+
+## Architecture (current — do not regress)
+
+- **Runtime**: Cloudflare Workers. Entry point `index.js` exports a default `fetch` handler. There is no Express and no `app.listen()`.
+- **Routing**: a single `if/else` chain on `url.pathname` + method in `index.js`.
+- **Database**: Cloudflare D1 (Edge SQLite). Schema in `db/schema.sql`. `ledger_entries` is append-only.
+- **Durable Objects**: The Umpire (`sheriff.js`) — singleton house agent that plays idle queued players and owns the SSE broadcaster. All SSE broadcasts go through the DO.
+- **Realtime**: Server-Sent Events on `/stream` (DO broadcaster), never polling on new endpoints.
+- **Config**: `wrangler.toml` is the source of truth for env vars. Secrets via `wrangler secret put`, never committed.
+- **Tests**: vitest with `@cloudflare/vitest-pool-workers` (Miniflare). Run with `npm test`.
+
+## Game rules (canonical — verify against `src/engine/resolver.js`)
+
+- Payoffs: CC (3,3), CD (0,5), DC (5,0), DD (1,1).
+- Match termination is stochastic: ~2% per scored round (`termination_prob`), not a fixed round count.
+- Round phases: `negotiating` (20s cheap talk) → `deciding` (30s). Missing the window = no action row, 0 points; opponent scores as if you cooperated. No auto-defect.
+- Three consecutive missed rounds by one agent → match `failed`, reliability −0.2, opponent gets APPT compensation.
+- Reliability +0.01 per completed match (cap 1.0). ELO-based queue matchmaking with weekly decay.
 
 ## What to optimize for
-- Low cost.
-- Simple deployment.
-- Clear code paths.
-- Replayability and auditability.
-- Append-only score history.
-- Deterministic game resolution.
 
-## Tech stack guidance
-Use the existing repo stack if present. If starting from scratch, prefer:
-- Backend: Go or a similarly simple compiled backend.
-- Database: SQLite with WAL mode enabled.
-- Frontend: minimal server-rendered pages or a lightweight web UI.
-- Deployment: one host, one process, one database file.
-- LLM usage: use Copilot for implementation guidance and boilerplate, but keep all game logic local and deterministic.
-
-## Game scope
-Only implement:
-- Agent registration.
-- API authentication.
-- Repeated Prisoner’s Dilemma matches.
-- Append-only ledger.
-- Replay page.
-- Leaderboard.
-
-Do not add:
-- Real-money betting.
-- KYC/AML.
-- Multi-game support.
-- Complex orchestration systems.
-- Microservices.
-- Event streaming infrastructure.
-
-## Database guidance
-Use SQLite tables for:
-- agents
-- matches
-- match_rounds
-- actions
-- ledger_entries
-- leaderboard_snapshots
-
-Important:
-- Treat the ledger as append-only.
-- Do not overwrite historical rounds.
-- Use WAL mode if SQLite is the database.
-- Keep transactions short and avoid long-running write locks.
+- Low cost, low latency, request-quota efficiency (SSE over polling).
+- Append-only, replayable, auditable scoring.
+- Deterministic resolution guards against double-processing (see `alreadyResolved` checks).
+- Race safety via `INSERT OR IGNORE`.
 
 ## Coding style
-- Prefer small, explicit functions.
-- Keep domain rules in one game/rules module.
-- Keep handlers thin.
-- Make API responses simple and stable.
-- Avoid clever abstractions unless they clearly reduce complexity.
-- Write code that is easy to inspect and replay.
 
-## Copilot tasking style
-Give Copilot one task at a time.
-Examples:
-- Create the agent registration API.
-- Implement the Prisoner’s Dilemma round engine.
-- Add the append-only ledger schema.
-- Build replay from stored match events.
-- Build the leaderboard query and page.
+- Small, explicit functions; thin handlers; domain rules in `src/engine/`.
+- No new dependencies without checking `docs/decision-log.md`.
+- No comments unless they explain *why*.
+- Every `GET` route must return `Vary: Accept`; JSON via `?format=json` or `Accept: application/json`.
 
 ## Definition of done
-A task is complete only when:
-- It compiles or runs cleanly.
-- It passes existing tests or a new focused test.
-- It preserves append-only history.
-- It is understandable from the replay.
-- It does not introduce unnecessary infrastructure.
-- It keeps runtime and operational cost low.
 
-## Success criteria
-The MVP is successful if:
-- A single VPS can run it.
-- SQLite can persist all required data reliably.
-- A match can be played end-to-end by two agents.
-- The replay exactly matches stored events.
-- The leaderboard reflects final settled scores.
-- The app can be deployed and understood without enterprise tooling.
+- `npm test` and `npm run lint` pass.
+- Behavior changes are covered by a test in `test/game.test.js`.
+- README/AGENTS.md/GEMINI.md stay true to the code.
+- Append-only ledger and the match state machine are preserved.
+
+## Tasking style
+
+Give Copilot one task at a time. Examples:
+- Add a new `/stats` JSON endpoint following the existing routing chain.
+- Implement a new game rule in `src/engine/resolver.js` with tests.
+- Fix an SSE event ordering bug in the Umpire DO.
+- Add a new language example agent under `agent/`.
