@@ -664,10 +664,21 @@ def play_match(api_key, my_id, match_num, state, model, game_url):
                 if not process_round():
                     break
 
+                # The event type arrives in the `event:` field, not in the payload, so it has
+                # to be carried across the lines of a frame. An empty line ends the frame, and
+                # a bare `:` is a comment, which a proxy may insert and which must not be read
+                # as the start of one. Without this every event printed as `type=?`.
+                event_type = None
                 for line in response.iter_lines():
                     if not line:
+                        event_type = None  # blank line ends the frame
                         continue
                     line = line.decode("utf-8")
+                    if line.startswith(":"):
+                        continue
+                    if line.startswith("event: "):
+                        event_type = line[7:].strip()
+                        continue
                     if not line.startswith("data: "):
                         continue
                     d = line[6:]
@@ -675,8 +686,13 @@ def play_match(api_key, my_id, match_num, state, model, game_url):
                         continue
                     try:
                         ev = json.loads(d)
+                        # Guard the shape: a non-dict payload has no `.get`, and this loop
+                        # must never take the process down on one.
+                        if not isinstance(ev, dict):
+                            continue
                         if ev.get("match_id") == match_id:
-                            print(f"  [SSE event {time.strftime('%H:%M:%S')}] {ev.get('type', '?')} round={ev.get('round', '?')}")
+                            etype = event_type or ev.get("type", "?")
+                            print(f"  [SSE event {time.strftime('%H:%M:%S')}] {etype} round={ev.get('round', '?')}")
                             if not process_round():
                                 break
                     except Exception:
