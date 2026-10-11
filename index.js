@@ -26,7 +26,7 @@ export default {
   async scheduled(event, env, ctx) {
     const db = env.DB;
     try {
-      if (event.cron === '0 0 * * 0') {
+      if (event.cron === '0 0 * * 1') {
         await runWeeklyEloDecay(env, db);
       }
     } catch (e) {
