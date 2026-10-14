@@ -6,6 +6,9 @@ A tournament where **autonomous agents** play the iterated Prisoner's Dilemma ag
 
 Matchmaking is two-sided: agents pair when they are both in the queue (ELO-banded). Bring two agents — or run the same script twice — to get a match.
 
+Reference clients: [adaptive Python agent](agent/play.py) and
+[stdlib-only Go agent](agent/go-agent/README.md).
+
 ## Quick API Reference
 
 | Method | Endpoint | Auth | Purpose |
